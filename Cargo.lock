@@ -1098,6 +1098,7 @@ dependencies = [
  "image",
  "jepret-core",
  "jepret-history",
+ "jepret-ui-theme",
  "tracing",
 ]
 

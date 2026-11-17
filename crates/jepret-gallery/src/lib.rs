@@ -36,10 +36,10 @@ pub fn run_gallery(config: &Config) -> Result<()> {
             }
         }
     };
-    app::run(backend, config.history.cleanup.use_recycle_bin)
+    app::run(backend, config)
 }
 
 /// Open the gallery over an arbitrary [`Source`] (used by `examples/fake.rs`).
 pub fn run_gallery_with(source: Arc<dyn Source>, config: &Config) -> Result<()> {
-    app::run(Ok(source), config.history.cleanup.use_recycle_bin)
+    app::run(Ok(source), config)
 }
