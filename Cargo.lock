@@ -1073,9 +1073,17 @@ dependencies = [
 name = "jepret-editor"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "anyhow",
+ "arboard",
+ "eframe",
+ "egui",
+ "epaint_default_fonts",
+ "image",
  "jepret-core",
+ "rfd",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
