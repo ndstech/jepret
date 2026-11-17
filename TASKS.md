@@ -153,6 +153,30 @@ capture hdr  overlay workflow history editor stitch recorder gallery settings
 - Ukur semua target di PRD §2, profil yang meleset, perbaiki.
 - `cargo clippy --workspace -- -D warnings` bersih. Build release + README cara pakai.
 
+## Wave 3 — Desain visual
+
+### T14 — Desain UI (dikerjakan Claude di Artifact)
+**Cara kerja:** desain dibuat oleh Claude lewat **Artifact (tipe Design)**, bukan langsung di kode. Hasilnya direview user, lalu diterjemahkan ke egui/Direct2D oleh ticket T15.
+
+**Layar yang didesain:**
+1. Overlay region — gelap luar seleksi, border seleksi, label `W × H`, magnifier + koordinat, hint bar shortcut, outline snap window.
+2. Editor — toolbar tool (ikon + tooltip shortcut), panel gaya (palet 9 warna, tebal, isi, bayangan), kanvas + zoom, status bar, cheat-sheet F1, dialog konfirmasi tutup.
+3. Galeri — grid thumbnail, filter bar, badge video/favorit/file hilang, menu aksi, panel cleanup + laporan.
+4. Settings — 7 tab (Umum, Hotkey & Workflow, Shortcut, Aplikasi eksternal, History & Cleanup, Recording, Capture), perekam kombinasi tombol, penanda bentrok, info box Snipping Tool.
+5. Tray menu, balon notifikasi, indikator rekam (border + timer), ikon tray idle/rekam, ikon aplikasi.
+
+**Batasan desain (wajib):**
+- Bisa diimplementasi di **egui 0.29** (tanpa efek yang tidak didukung: blur latar, animasi kompleks, font variabel). Overlay & border di Direct2D.
+- Nuansa Windows 11 (Fluent): sudut membulat, aksen satu warna, ruang lega; **light & dark**.
+- Ringan: tanpa gambar latar besar; ikon sebagai SVG sederhana/icon font yang bisa di-embed.
+- Shortcut terlihat di mana-mana (tooltip, menu) — itu identitas aplikasi.
+- Bahasa UI: Indonesia.
+
+**Output:** token desain (warna light/dark, radius, spacing, tipografi), mockup tiap layar, set ikon tool (13) + ikon tray/app.
+
+### T15 — Terapkan desain
+Implementasi token & mockup T14 ke `jepret-editor`, `jepret-gallery`, `jepret-settings` (tema egui bersama — kemungkinan crate baru `jepret-ui-theme`), overlay & border di `jepret-overlay`, ikon di `jepret-app`. Paralel per crate seperti Wave 1.
+
 ---
 
 ## Cara menjalankan agent paralel
