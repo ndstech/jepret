@@ -23,14 +23,18 @@ mod ui;
 pub fn run_settings(config_path: &Path) -> Result<()> {
     // A broken file must not be silently overwritten: surface the parse error.
     let cfg = Config::load(config_path)?;
-    let app = ui::SettingsApp::new(config_path.to_path_buf(), cfg);
+    let mut app = ui::SettingsApp::new(config_path.to_path_buf(), cfg);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Jepret - Pengaturan")
-            .with_inner_size([820.0, 600.0])
-            .with_min_inner_size([640.0, 420.0]),
+            .with_inner_size([1040.0, 720.0])
+            .with_min_inner_size([800.0, 520.0]),
         ..Default::default()
     };
-    eframe::run_native("Jepret Settings", options, Box::new(move |_cc| Ok(Box::new(app))))
+    eframe::run_native("Jepret Settings", options, Box::new(move |cc| {
+        // Fonts + visuals from the shared design theme.
+        app.install_theme(&cc.egui_ctx);
+        Ok(Box::new(app))
+    }))
         .map_err(|e| anyhow::anyhow!("settings window failed: {e}"))
 }
