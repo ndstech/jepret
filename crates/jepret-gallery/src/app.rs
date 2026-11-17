@@ -53,6 +53,7 @@ const SCAN_PAGE: u32 = 500;
 pub fn run(backend: Result<Arc<dyn Source>, String>, config: &Config) -> jepret_core::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_icon(std::sync::Arc::new(jepret_ui_theme::app_icon()))
             .with_title("Jepret - Galeri")
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([420.0, 320.0]),

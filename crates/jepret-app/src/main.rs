@@ -13,7 +13,7 @@ mod command;
 mod daemon;
 mod dispatch;
 mod hotkey;
-mod raster;
+use jepret_ui_theme::raster;
 
 use std::path::PathBuf;
 

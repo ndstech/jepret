@@ -18,6 +18,7 @@
 
 pub mod fonts;
 pub mod icons;
+pub mod raster;
 pub mod tokens;
 pub mod widgets;
 
@@ -25,6 +26,13 @@ pub use icons::Icon;
 pub use tokens::Palette;
 
 use jepret_core::config::ThemeMode;
+
+/// The Jepret app icon (teal viewfinder) for an egui window's title bar:
+/// `ViewportBuilder::default().with_icon(Arc::new(jepret_ui_theme::app_icon()))`.
+pub fn app_icon() -> egui::IconData {
+    let (rgba, width, height) = raster::app_icon_rgba(64);
+    egui::IconData { rgba, width, height }
+}
 
 /// Resolve the mode, load fonts, apply visuals + spacing. Returns the palette
 /// the caller should keep and use for custom painting.

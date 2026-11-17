@@ -3,13 +3,13 @@
 //! `.res`) so no resource-compiler crate is needed. The icon is rasterised
 //! deterministically from the SVG path by `src/raster.rs`.
 
-#[path = "src/raster.rs"]
+#[path = "../jepret-ui-theme/src/raster.rs"]
 mod raster;
 
 fn main() {
     println!("cargo:rerun-if-changed=jepret.manifest");
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=src/raster.rs");
+    println!("cargo:rerun-if-changed=../jepret-ui-theme/src/raster.rs");
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
         println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");

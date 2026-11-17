@@ -465,7 +465,7 @@ mod tests {
 
     #[test]
     fn frame_path_matches_theme() {
-        assert_eq!(FRAME_PATH, jepret_ui_theme::Icon::Frame.path());
+        assert_eq!(FRAME_PATH, crate::Icon::Frame.path());
     }
 
     #[test]

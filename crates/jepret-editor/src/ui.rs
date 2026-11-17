@@ -1578,6 +1578,7 @@ impl eframe::App for EditorApp {
 pub fn run(path: PathBuf, config: Config) -> jepret_core::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_icon(std::sync::Arc::new(jepret_ui_theme::app_icon()))
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([640.0, 400.0])
             .with_title("Jepret Editor"),
