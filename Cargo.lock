@@ -1040,6 +1040,7 @@ dependencies = [
  "jepret-recorder",
  "jepret-scroll",
  "jepret-settings",
+ "jepret-ui-theme",
  "jepret-workflow",
  "tracing",
  "tracing-appender",

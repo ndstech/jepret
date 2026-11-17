@@ -20,6 +20,7 @@ jepret-scroll.workspace = true
 jepret-editor.workspace = true
 jepret-gallery.workspace = true
 jepret-settings.workspace = true
+jepret-ui-theme.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

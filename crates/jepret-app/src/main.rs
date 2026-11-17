@@ -13,6 +13,7 @@ mod command;
 mod daemon;
 mod dispatch;
 mod hotkey;
+mod raster;
 
 use std::path::PathBuf;
 
