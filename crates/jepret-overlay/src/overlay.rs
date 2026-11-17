@@ -10,7 +10,10 @@ use anyhow::{bail, ensure, Context};
 use jepret_core::{Image, MonitorInfo, Point, Rect, Result};
 use tracing::{debug, warn};
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_UNKNOWN, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F,
     D2D_SIZE_U,
@@ -31,18 +34,19 @@ use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, Update
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT,
+    VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW,
     LoadCursorW, PostQuitMessage, RegisterClassExW, SetForegroundWindow,
-    SetWindowLongPtrW, ShowWindow, TranslateMessage, CREATESTRUCTW, CS_OWNDC, GWLP_USERDATA, IDC_CROSS, MSG,
-    SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    SetWindowLongPtrW, ShowWindow, TranslateMessage, CREATESTRUCTW, CS_DBLCLKS, CS_OWNDC, GWLP_USERDATA, IDC_CROSS, MSG,
+    SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WNDCLASSEXW, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP,
 };
 
-use crate::controller::{Controller, Key, Outcome};
+use crate::controller::{hex_color, hint_bar_text, Controller, Key, Mods, Outcome};
 use crate::magnifier;
 use crate::OverlayOptions;
 
@@ -76,6 +80,9 @@ struct State {
     /// bitmap after device loss.
     frozen: *const Image,
     activated: bool,
+    /// Set once a result is decided; later events (e.g. the WM_ACTIVATE sent
+    /// while the window is being destroyed) must not overwrite it.
+    finished: bool,
     result: Option<Rect>,
 }
 
@@ -113,7 +120,7 @@ fn register_class() -> Result<()> {
             };
             let wc = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-                style: CS_OWNDC,
+                style: CS_OWNDC | CS_DBLCLKS,
                 lpfnWndProc: Some(wndproc),
                 hInstance: hinst.into(),
                 hCursor: LoadCursorW(None, IDC_CROSS).unwrap_or_default(),
@@ -153,12 +160,19 @@ pub(crate) fn run(
     let mut state = Box::new(State {
         hwnd: HWND::default(),
         origin,
-        ctl: Controller::new(origin, opts.initial, opts.window_rects.clone()),
+        ctl: Controller::new(
+            origin,
+            opts.initial,
+            opts.window_rects.clone(),
+            monitors.iter().map(|m| m.rect).collect(),
+            opts.magnifier,
+        ),
         opts: opts.clone(),
         monitors: monitors.to_vec(),
         gfx: None,
         frozen: frozen as *const Image,
         activated: false,
+        finished: false,
         result: None,
     });
 
@@ -302,6 +316,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             st.apply(o);
             LRESULT(0)
         }
+        WM_LBUTTONDBLCLK => {
+            let p = st.desktop_point(lp);
+            let o = st.ctl.double_click(p);
+            st.apply(o);
+            LRESULT(0)
+        }
         WM_RBUTTONDOWN => {
             let o = st.ctl.right_click();
             st.apply(o);
@@ -315,12 +335,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 x if x == VK_DOWN.0 => Some(Key::Down),
                 x if x == VK_RETURN.0 => Some(Key::Enter),
                 x if x == VK_ESCAPE.0 => Some(Key::Escape),
+                x if x == VK_SPACE.0 => Some(Key::Space),
+                x if x == VK_TAB.0 => Some(Key::Tab),
+                0x46 => Some(Key::Monitor),   // F
+                0x41 => Some(Key::All),       // A
+                0x4D => Some(Key::Magnifier), // M
+                0x43 => Some(Key::CopyColor), // C
+                0x48 => Some(Key::HintBar),   // H
                 _ => None,
             };
             match key {
                 Some(k) => {
-                    let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
-                    let o = st.ctl.key(k, shift);
+                    let mods = Mods {
+                        shift: GetKeyState(VK_SHIFT.0 as i32) < 0,
+                        ctrl: GetKeyState(VK_CONTROL.0 as i32) < 0,
+                    };
+                    // Letter shortcuts are plain keys; leave Ctrl+letter to the system.
+                    let is_letter = matches!(k, Key::Monitor | Key::All | Key::Magnifier | Key::CopyColor | Key::HintBar);
+                    if is_letter && mods.ctrl {
+                        return DefWindowProcW(hwnd, msg, wp, lp);
+                    }
+                    let o = st.ctl.key(k, mods);
                     st.apply(o);
                     LRESULT(0)
                 }
@@ -363,7 +398,27 @@ impl State {
                 Outcome::Redraw => {
                     let _ = InvalidateRect(self.hwnd, None, false);
                 }
+                Outcome::CopyColor(p) => {
+                    // SAFETY: `frozen` is valid for the whole message loop.
+                    let img = &*self.frozen;
+                    let (x, y) = (p.x - self.origin.x, p.y - self.origin.y);
+                    if x >= 0 && y >= 0 && (x as u32) < img.width && (y as u32) < img.height {
+                        let hex = hex_color(img.pixel(x as u32, y as u32));
+                        match set_clipboard_text(self.hwnd, &hex) {
+                            Ok(()) => self.ctl.set_notice(format!("Warna {hex} disalin")),
+                            Err(e) => {
+                                warn!("overlay: copy colour failed: {e:#}");
+                                self.ctl.set_notice("Gagal menyalin warna");
+                            }
+                        }
+                    }
+                    let _ = InvalidateRect(self.hwnd, None, false);
+                }
                 Outcome::Done(r) => {
+                    if self.finished {
+                        return;
+                    }
+                    self.finished = true;
                     self.result = r;
                     let _ = DestroyWindow(self.hwnd);
                 }
@@ -439,20 +494,28 @@ unsafe fn draw_scene(g: &Gfx, ctl: &Controller, opts: &OverlayOptions, monitors:
         }
     }
 
-    if let Some(hint) = opts.hint.as_deref() {
-        let mon = ctl
-            .cursor()
-            .and_then(|c| monitors.iter().find(|m| m.rect.contains(c)))
-            .map(|m| m.rect)
-            .unwrap_or(origin);
-        if let Some((lw, _)) = g.measure(hint) {
-            let cx = (mon.x - origin.x) as f32 + mon.width as f32 / 2.0;
-            let top = (mon.y - origin.y) as f32 + 16.0;
-            g.label(hint, (cx - (lw + 12.0) / 2.0).max(0.0), top);
+    let mon = ctl
+        .cursor()
+        .and_then(|c| monitors.iter().find(|m| m.rect.contains(c)))
+        .map(|m| m.rect)
+        .unwrap_or(origin);
+    let cx = (mon.x - origin.x) as f32 + mon.width as f32 / 2.0;
+    let mut top = (mon.y - origin.y) as f32 + 16.0;
+    for text in [opts.hint.as_deref(), ctl.notice()].into_iter().flatten() {
+        if let Some((lw, lh)) = g.measure(text) {
+            g.label(text, (cx - (lw + 12.0) / 2.0).max(0.0), top);
+            top += lh + 6.0 + 6.0;
+        }
+    }
+    if ctl.hint_bar_on() {
+        let text = hint_bar_text();
+        if let Some((lw, lh)) = g.measure(text) {
+            let bottom = (mon.y - origin.y) as f32 + mon.height as f32;
+            g.label(text, (cx - (lw + 12.0) / 2.0).max(0.0), bottom - lh - 6.0 - 48.0);
         }
     }
 
-    if opts.magnifier {
+    if ctl.magnifier_on() {
         if let Some(c) = ctl.cursor() {
             draw_loupe(g, c, shown, origin, ctl.bounds());
         }
@@ -515,5 +578,34 @@ impl Gfx {
                 D2D1_DRAW_TEXT_OPTIONS_NONE,
             );
         }
+    }
+}
+
+/// Put `text` on the clipboard as CF_UNICODETEXT.
+fn set_clipboard_text(hwnd: HWND, text: &str) -> Result<()> {
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let bytes = wide.len() * 2;
+    // SAFETY: standard clipboard protocol; the allocation is handed to the
+    // system on success and freed by us only on failure paths before that.
+    unsafe {
+        OpenClipboard(hwnd).context("OpenClipboard")?;
+        let res = (|| -> Result<()> {
+            EmptyClipboard()?;
+            let h = GlobalAlloc(GMEM_MOVEABLE, bytes)?;
+            let dst = GlobalLock(h) as *mut u16;
+            if dst.is_null() {
+                let _ = GlobalFree(h);
+                bail!("GlobalLock failed");
+            }
+            std::ptr::copy_nonoverlapping(wide.as_ptr(), dst, wide.len());
+            let _ = GlobalUnlock(h);
+            if let Err(e) = SetClipboardData(CF_UNICODETEXT.0 as u32, HANDLE(h.0)) {
+                let _ = GlobalFree(h);
+                return Err(e.into());
+            }
+            Ok(())
+        })();
+        let _ = CloseClipboard();
+        res
     }
 }
