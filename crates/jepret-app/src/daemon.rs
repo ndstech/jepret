@@ -80,6 +80,9 @@ const WM_REC_STATE: u32 = WM_APP + 3;
 
 const TIMER_RELOAD: usize = 1;
 const TIMER_REC: usize = 2;
+const TIMER_IDLE: usize = 3;
+const IDLE_RELEASE_MS: u32 = 60_000;
+const WM_CAPTURE_DONE: u32 = WM_APP + 5;
 
 const ID_GALLERY: usize = 200;
 const ID_SETTINGS: usize = 201;
@@ -524,8 +527,30 @@ fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> 
             }
             Some(LRESULT(0))
         }
+        WM_CAPTURE_DONE => {
+            // One-shot idle timer, re-armed after every capture (no polling).
+            // SAFETY: timer on our own window.
+            unsafe {
+                SetTimer(h, TIMER_IDLE, IDLE_RELEASE_MS, None);
+            }
+            Some(LRESULT(0))
+        }
         WM_TIMER => {
             match wp.0 {
+                TIMER_IDLE => {
+                    // SAFETY: our own timer.
+                    unsafe {
+                        let _ = KillTimer(h, TIMER_IDLE);
+                    }
+                    if BUSY.load(Ordering::Acquire) || dispatch::is_recording() {
+                        // SAFETY: re-arm; try again after another idle period.
+                        unsafe {
+                            SetTimer(h, TIMER_IDLE, IDLE_RELEASE_MS, None);
+                        }
+                    } else {
+                        release_capture_cache();
+                    }
+                }
                 TIMER_RELOAD => {
                     // SAFETY: our own timer.
                     unsafe {
@@ -569,6 +594,12 @@ fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> 
         }
         _ => None,
     }
+}
+
+/// Free cached D3D11 devices / duplications after ~60 s without a capture.
+fn release_capture_cache() {
+    debug!("idle: releasing capture cache");
+    // TODO(merge): jepret_capture::release_cache()
 }
 
 fn shutdown(h: HWND) {
@@ -697,6 +728,10 @@ fn spawn_capture_with(kind: CaptureKind, actions: Option<Vec<Action>>) {
             }
         }
         BUSY.store(false, Ordering::Release);
+        // SAFETY: posting to our own window; failure just skips the idle release.
+        unsafe {
+            let _ = PostMessageW(hwnd(), WM_CAPTURE_DONE, WPARAM(0), LPARAM(0));
+        }
     });
     if let Err(e) = spawned {
         BUSY.store(false, Ordering::Release);
