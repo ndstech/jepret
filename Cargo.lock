@@ -125,6 +125,7 @@ dependencies = [
  "anyhow",
  "jepret-core",
  "tracing",
+ "windows",
 ]
 
 [[package]]

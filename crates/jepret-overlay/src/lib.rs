@@ -1,11 +1,30 @@
 //! Region selection overlay. Owner: **T03**.
 //!
-//! One borderless topmost layered window covering the virtual desktop,
-//! drawing the frozen screenshot with Direct2D, darkened outside the
-//! selection. See PRD F3 for interactions.
+//! One borderless topmost window covering the virtual desktop, drawing the
+//! frozen screenshot with Direct2D, darkened outside the selection. See PRD F3
+//! for interactions.
 //!
 //! Does **not** depend on `jepret-capture`: the caller passes everything in,
 //! so this crate can be developed and demoed with a synthetic image.
+//!
+//! Layout: pure logic ([`selection`], [`snap`], [`magnifier`], [`controller`])
+//! has no Win32 and is unit tested; `overlay` / `border` hold the Win32 and
+//! Direct2D glue.
+//!
+//! Interaction summary: drag selects (pixel-inclusive, release confirms);
+//! click without drag picks the hovered window (needs `window_rects`);
+//! arrows nudge 1 px, Shift+arrows resize the bottom-right edge; Enter
+//! confirms; Esc / right click cancel; losing focus cancels.
+
+pub mod controller;
+pub mod magnifier;
+pub mod selection;
+pub mod snap;
+
+mod border;
+mod overlay;
+
+pub use border::RegionBorder;
 
 use jepret_core::{Image, MonitorInfo, Rect, Result};
 
@@ -29,23 +48,15 @@ pub struct OverlayOptions {
 /// Returns the selected rect in virtual-desktop px, or `None` if cancelled.
 /// Must be called on a thread that may pump Win32 messages (it runs its own
 /// modal message loop). Target: window visible ≤ 50 ms after call.
+///
+/// The calling thread is switched to Per-Monitor-DPI-V2 awareness for the
+/// duration of the call so window geometry is in physical pixels regardless
+/// of the process manifest.
 pub fn select_region(
-    _frozen: &Image,
-    _origin: Rect,
-    _monitors: &[MonitorInfo],
-    _opts: &OverlayOptions,
+    frozen: &Image,
+    origin: Rect,
+    monitors: &[MonitorInfo],
+    opts: &OverlayOptions,
 ) -> Result<Option<Rect>> {
-    anyhow::bail!("TODO(T03): select_region")
-}
-
-/// Non-interactive click-through border drawn around `rect` while
-/// recording / scroll-capturing. Dropping the handle removes it.
-pub struct RegionBorder {
-    _private: (),
-}
-
-impl RegionBorder {
-    pub fn show(_rect: Rect) -> Result<Self> {
-        anyhow::bail!("TODO(T03): RegionBorder::show")
-    }
+    overlay::run(frozen, origin, monitors, opts)
 }
