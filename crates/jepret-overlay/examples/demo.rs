@@ -129,6 +129,13 @@ fn main() -> anyhow::Result<()> {
     }
     let args: Vec<String> = std::env::args().collect();
     let selftest = args.iter().any(|a| a == "--selftest");
+    if args.iter().any(|a| a == "--border-only") {
+        // Recording indicator only (no overlay): 3 s, timer should tick.
+        let _b = RegionBorder::show_recording(Rect::new(300, 200, 500, 300), "Ctrl+Alt+PrtSc untuk stop")?;
+        std::thread::sleep(Duration::from_secs(3));
+        println!("border-only OK");
+        return Ok(());
+    }
 
     let mons = monitors();
     anyhow::ensure!(!mons.is_empty(), "no monitors found");
@@ -169,9 +176,9 @@ fn main() -> anyhow::Result<()> {
         println!("selftest OK: selection is pixel-exact");
     }
     if let Some(r) = res {
-        println!("showing RegionBorder around {r:?} for 2 s");
-        let _b = RegionBorder::show(r)?;
-        std::thread::sleep(Duration::from_secs(2));
+        println!("showing RegionBorder (recording variant) around {r:?} for 3 s");
+        let _b = RegionBorder::show_recording(r, "Ctrl+Alt+PrtSc untuk stop")?;
+        std::thread::sleep(Duration::from_secs(3));
     }
     Ok(())
 }

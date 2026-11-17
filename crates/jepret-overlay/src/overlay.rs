@@ -14,20 +14,22 @@ use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND, LPARAM, LRESULT, POIN
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
+use windows::Foundation::Numerics::Matrix3x2;
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_UNKNOWN, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F,
     D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1SolidColorBrush,
-    D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_BITMAP_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_NONE,
-    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_HWND_RENDER_TARGET_PROPERTIES,
-    D2D1_PRESENT_OPTIONS_IMMEDIATELY, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
-    D2D1_RENDER_TARGET_USAGE_NONE,
+    D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1SolidColorBrush, ID2D1StrokeStyle,
+    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_BITMAP_PROPERTIES,
+    D2D1_CAP_STYLE_FLAT, D2D1_DASH_STYLE_DASH, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+    D2D1_FEATURE_LEVEL_DEFAULT, D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_LAYER_OPTIONS_NONE,
+    D2D1_LAYER_PARAMETERS, D2D1_LINE_JOIN_MITER, D2D1_PRESENT_OPTIONS_IMMEDIATELY, D2D1_RENDER_TARGET_PROPERTIES,
+    D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout, DWRITE_FACTORY_TYPE_SHARED,
-    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_METRICS,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_METRICS,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN};
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, UpdateWindow, PAINTSTRUCT};
@@ -46,27 +48,36 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_TOPMOST, WS_POPUP,
 };
 
-use crate::controller::{hex_color, hint_bar_text, Controller, Key, Mods, Outcome};
+use crate::controller::{hex_color, Controller, Key, Mods, Outcome, HINT_ROWS};
 use crate::magnifier;
+use crate::style;
 use crate::OverlayOptions;
 
 const CLASS_NAME: PCWSTR = w!("JepretOverlayWindow");
 /// D2DERR_RECREATE_TARGET: device lost, rebuild render target + bitmap.
 const D2DERR_RECREATE_TARGET: windows::core::HRESULT = windows::core::HRESULT(0x8899000Cu32 as i32);
 
-const DIM: D2D1_COLOR_F = D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.55 };
-const ACCENT: D2D1_COLOR_F = D2D1_COLOR_F { r: 0.23, g: 0.51, b: 0.96, a: 1.0 };
-const WHITE: D2D1_COLOR_F = D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
-const LABEL_BG: D2D1_COLOR_F = D2D1_COLOR_F { r: 0.08, g: 0.08, b: 0.1, a: 0.88 };
-const CROSS: D2D1_COLOR_F = D2D1_COLOR_F { r: 1.0, g: 0.2, b: 0.2, a: 1.0 };
+/// Text formats used by the overlay (Segoe UI Variable / Cascadia Mono with
+/// fallbacks, see [`style`]).
+struct Fonts {
+    /// 12 px UI text.
+    ui: IDWriteTextFormat,
+    /// 11 px mono (kbd chips, magnifier).
+    mono_s: IDWriteTextFormat,
+    /// 13 px semibold mono (size label).
+    mono_b: IDWriteTextFormat,
+}
 
 /// GPU resources; dropped and rebuilt on device loss.
 struct Gfx {
+    factory: ID2D1Factory,
     rt: ID2D1HwndRenderTarget,
     bitmap: ID2D1Bitmap,
     brush: ID2D1SolidColorBrush,
     dwrite: IDWriteFactory,
-    format: IDWriteTextFormat,
+    fonts: Fonts,
+    /// Dashed stroke for the snap-window outline.
+    dash: ID2D1StrokeStyle,
 }
 
 struct State {
@@ -259,18 +270,28 @@ unsafe fn create_gfx(hwnd: HWND, frozen: &Image) -> Result<Gfx> {
     let bitmap = rt
         .CreateBitmap(size, Some(frozen.pixels.as_ptr() as *const c_void), frozen.stride() as u32, &bp)
         .context("CreateBitmap")?;
-    let brush = rt.CreateSolidColorBrush(&WHITE, None)?;
+    let brush = rt.CreateSolidColorBrush(&style::WHITE, None)?;
     let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-    let format = dwrite.CreateTextFormat(
-        w!("Segoe UI"),
+    let ui = style::pick_family(&dwrite, &style::UI_FONTS);
+    let mono = style::pick_family(&dwrite, &style::MONO_FONTS);
+    let fonts = Fonts {
+        ui: style::text_format(&dwrite, ui, 12.0, DWRITE_FONT_WEIGHT_NORMAL)?,
+        mono_s: style::text_format(&dwrite, mono, 11.0, DWRITE_FONT_WEIGHT_NORMAL)?,
+        mono_b: style::text_format(&dwrite, mono, 13.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
+    };
+    let dash = factory.CreateStrokeStyle(
+        &D2D1_STROKE_STYLE_PROPERTIES {
+            startCap: D2D1_CAP_STYLE_FLAT,
+            endCap: D2D1_CAP_STYLE_FLAT,
+            dashCap: D2D1_CAP_STYLE_FLAT,
+            lineJoin: D2D1_LINE_JOIN_MITER,
+            miterLimit: 10.0,
+            dashStyle: D2D1_DASH_STYLE_DASH,
+            dashOffset: 0.0,
+        },
         None,
-        DWRITE_FONT_WEIGHT_NORMAL,
-        DWRITE_FONT_STYLE_NORMAL,
-        DWRITE_FONT_STRETCH_NORMAL,
-        13.0,
-        w!("en-us"),
     )?;
-    Ok(Gfx { rt, bitmap, brush, dwrite, format })
+    Ok(Gfx { factory, rt, bitmap, brush, dwrite, fonts, dash })
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -440,7 +461,8 @@ impl State {
         let Some(g) = self.gfx.as_ref() else { return };
         let t = Instant::now();
         g.rt.BeginDraw();
-        draw_scene(g, &self.ctl, &self.opts, &self.monitors, self.origin);
+        // SAFETY: `frozen` is valid for the whole message loop.
+        draw_scene(g, &self.ctl, &self.opts, &self.monitors, self.origin, &*self.frozen);
         match g.rt.EndDraw(None, None) {
             Ok(()) => {}
             Err(e) if e.code() == D2DERR_RECREATE_TARGET => {
@@ -462,35 +484,78 @@ fn rect_f(r: Rect, origin: Rect) -> D2D_RECT_F {
     }
 }
 
-unsafe fn draw_scene(g: &Gfx, ctl: &Controller, opts: &OverlayOptions, monitors: &[MonitorInfo], origin: Rect) {
+fn rr(r: D2D_RECT_F, radius: f32) -> D2D1_ROUNDED_RECT {
+    D2D1_ROUNDED_RECT { rect: r, radiusX: radius, radiusY: radius }
+}
+
+fn inset(r: D2D_RECT_F, d: f32) -> D2D_RECT_F {
+    D2D_RECT_F { left: r.left + d, top: r.top + d, right: r.right - d, bottom: r.bottom - d }
+}
+
+unsafe fn draw_scene(
+    g: &Gfx,
+    ctl: &Controller,
+    opts: &OverlayOptions,
+    monitors: &[MonitorInfo],
+    origin: Rect,
+    frozen: &Image,
+) {
     let nn = D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR;
     let full = rect_f(origin, origin);
     g.rt.DrawBitmap(&g.bitmap, Some(&full), 1.0, nn, Some(&full));
-    g.brush.SetColor(&DIM);
+    g.brush.SetColor(&style::DIM);
     g.rt.FillRectangle(&full, &g.brush);
 
-    let shown = ctl.shown_rect();
-    if let Some(r) = shown {
-        // Re-draw the selected area undimmed.
+    if let Some(r) = ctl.shown_rect() {
+        let hover = ctl.showing_hover();
         let rf = rect_f(r, origin);
+        // Re-draw the selected area undimmed.
         g.rt.DrawBitmap(&g.bitmap, Some(&rf), 1.0, nn, Some(&rf));
-        g.brush.SetColor(&ACCENT);
-        let width = if ctl.showing_hover() { 3.0 } else { 1.0 };
-        let half = width / 2.0;
-        let outline = D2D_RECT_F {
-            left: rf.left + half,
-            top: rf.top + half,
-            right: rf.right - half,
-            bottom: rf.bottom - half,
-        };
-        g.rt.DrawRectangle(&outline, &g.brush, width, None);
+        let outline = inset(rf, 1.0);
+        if hover {
+            g.brush.SetColor(&style::SNAP);
+            g.rt.DrawRectangle(&outline, &g.brush, 2.0, &g.dash);
+        } else {
+            g.brush.SetColor(&style::ACCENT);
+            g.rt.DrawRectangle(&outline, &g.brush, 2.0, None);
+            // Corner handles: 8 px white squares with an accent border.
+            for (cx, cy) in [
+                (rf.left + 1.0, rf.top + 1.0),
+                (rf.right - 1.0, rf.top + 1.0),
+                (rf.left + 1.0, rf.bottom - 1.0),
+                (rf.right - 1.0, rf.bottom - 1.0),
+            ] {
+                let h = D2D_RECT_F { left: cx - 4.0, top: cy - 4.0, right: cx + 4.0, bottom: cy + 4.0 };
+                g.brush.SetColor(&style::WHITE);
+                g.rt.FillRoundedRectangle(&rr(h, 2.0), &g.brush);
+                g.brush.SetColor(&style::ACCENT);
+                g.rt.DrawRoundedRectangle(&rr(inset(h, 0.75), 2.0), &g.brush, 1.5, None);
+            }
+        }
 
+        // Size label: accent pill, above-left of the selection (inside when
+        // there is no room above).
         let text = format!("{} \u{d7} {}", r.width, r.height);
-        if let Some((lw, lh)) = g.measure(&text) {
-            let (lw, lh) = (lw + 12.0, lh + 6.0);
-            let x = rf.left.clamp(0.0, (full.right - lw).max(0.0));
-            let y = if rf.top - lh - 4.0 >= 0.0 { rf.top - lh - 4.0 } else { rf.top + 4.0 };
-            g.label(&text, x, y);
+        let (tw, th) = g.measure(&g.fonts.mono_b, &text);
+        let (pw, ph) = (tw + 20.0, th + 8.0);
+        let x = (rf.left - 2.0).clamp(0.0, (full.right - pw).max(0.0));
+        let y = if rf.top - ph - 8.0 >= 0.0 { rf.top - ph - 8.0 } else { rf.top + 8.0 };
+        g.brush.SetColor(&style::ACCENT);
+        g.rt.FillRoundedRectangle(&rr(D2D_RECT_F { left: x, top: y, right: x + pw, bottom: y + ph }, 6.0), &g.brush);
+        g.text(&g.fonts.mono_b, &text, x + 10.0, y + 4.0, &style::WHITE);
+
+        if hover {
+            let label = "Tab \u{b7} snap ke window ini";
+            let (lw, lh) = g.measure(&g.fonts.ui, label);
+            let (bw, bh) = (lw + 16.0, lh + 6.0);
+            let bx = (x + pw + 8.0).min((full.right - bw).max(0.0));
+            let by = y + (ph - bh) / 2.0;
+            g.brush.SetColor(&style::SNAP_LABEL_BG);
+            g.rt.FillRoundedRectangle(
+                &rr(D2D_RECT_F { left: bx, top: by, right: bx + bw, bottom: by + bh }, 6.0),
+                &g.brush,
+            );
+            g.text(&g.fonts.ui, label, bx + 8.0, by + 3.0, &style::TEXT);
         }
     }
 
@@ -502,81 +567,202 @@ unsafe fn draw_scene(g: &Gfx, ctl: &Controller, opts: &OverlayOptions, monitors:
     let cx = (mon.x - origin.x) as f32 + mon.width as f32 / 2.0;
     let mut top = (mon.y - origin.y) as f32 + 16.0;
     for text in [opts.hint.as_deref(), ctl.notice()].into_iter().flatten() {
-        if let Some((lw, lh)) = g.measure(text) {
-            g.label(text, (cx - (lw + 12.0) / 2.0).max(0.0), top);
-            top += lh + 6.0 + 6.0;
-        }
+        let (lw, lh) = g.measure(&g.fonts.ui, text);
+        let (bw, bh) = (lw + 24.0, lh + 12.0);
+        let x = (cx - bw / 2.0).max(0.0);
+        g.brush.SetColor(&style::HINT_BG);
+        g.rt.FillRoundedRectangle(&rr(D2D_RECT_F { left: x, top, right: x + bw, bottom: top + bh }, 8.0), &g.brush);
+        g.text(&g.fonts.ui, text, x + 12.0, top + 6.0, &style::TEXT);
+        top += bh + 6.0;
     }
     if ctl.hint_bar_on() {
-        let text = hint_bar_text();
-        if let Some((lw, lh)) = g.measure(text) {
-            let bottom = (mon.y - origin.y) as f32 + mon.height as f32;
-            g.label(text, (cx - (lw + 12.0) / 2.0).max(0.0), bottom - lh - 6.0 - 48.0);
-        }
+        draw_hint_bar(g, cx, (mon.y - origin.y) as f32 + mon.height as f32 - 28.0);
     }
 
     if ctl.magnifier_on() {
         if let Some(c) = ctl.cursor() {
-            draw_loupe(g, c, shown, origin, ctl.bounds());
+            draw_loupe(g, c, origin, ctl.bounds(), frozen);
         }
     }
 }
 
-unsafe fn draw_loupe(g: &Gfx, cursor: Point, shown: Option<Rect>, origin: Rect, bounds: Rect) {
+/// Two-row key hint bar, centred on `cx`, bottom edge at `bottom`.
+/// (key, description, key width, key height, description width).
+type HintItem<'a> = (&'a str, &'a str, f32, f32, f32);
+
+unsafe fn draw_hint_bar(g: &Gfx, cx: f32, bottom: f32) {
+    const GAP_ITEM: f32 = 16.0;
+    const GAP_KBD: f32 = 6.0;
+    // Pre-measure: (kbd text w, kbd text h, desc w, desc h) per item.
+    let rows: Vec<Vec<HintItem>> = HINT_ROWS
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|&(k, t)| {
+                    let (kw, kh) = g.measure(&g.fonts.mono_s, k);
+                    let (tw, _) = g.measure(&g.fonts.ui, t);
+                    (k, t, kw, kh, tw)
+                })
+                .collect()
+        })
+        .collect();
+    // kbd chip: padding 1px 6px, border 1px (2px at the bottom).
+    let chip_h = rows.iter().flatten().map(|i| i.3).fold(0.0, f32::max) + 2.0 + 3.0;
+    let row_w = |row: &Vec<HintItem>| {
+        row.iter().map(|i| (i.2 + 14.0) + GAP_KBD + i.4).sum::<f32>() + GAP_ITEM * row.len().saturating_sub(1) as f32
+    };
+    let inner_w = rows.iter().map(row_w).fold(0.0, f32::max);
+    let (box_w, box_h) = (inner_w + 32.0, chip_h * 2.0 + 6.0 + 20.0);
+    let left = (cx - box_w / 2.0).max(0.0);
+    let top = bottom - box_h;
+    let panel = D2D_RECT_F { left, top, right: left + box_w, bottom };
+    g.brush.SetColor(&style::HINT_BG);
+    g.rt.FillRoundedRectangle(&rr(panel, 12.0), &g.brush);
+    g.brush.SetColor(&style::PANEL_BORDER);
+    g.rt.DrawRoundedRectangle(&rr(inset(panel, 0.5), 12.0), &g.brush, 1.0, None);
+
+    let mut y = top + 10.0;
+    for row in &rows {
+        let mut x = left + 16.0;
+        for &(k, t, kw, kh, tw) in row {
+            let chip = D2D_RECT_F { left: x, top: y, right: x + kw + 14.0, bottom: y + chip_h };
+            g.brush.SetColor(&style::KBD_BG);
+            g.rt.FillRoundedRectangle(&rr(chip, 4.0), &g.brush);
+            g.brush.SetColor(&style::KBD_BORDER);
+            g.rt.DrawRoundedRectangle(&rr(inset(chip, 0.5), 4.0), &g.brush, 1.0, None);
+            // Thicker bottom edge.
+            g.rt.DrawLine(
+                D2D_POINT_2F { x: chip.left + 3.0, y: chip.bottom - 1.5 },
+                D2D_POINT_2F { x: chip.right - 3.0, y: chip.bottom - 1.5 },
+                &g.brush,
+                1.0,
+                None,
+            );
+            g.text(&g.fonts.mono_s, k, x + 7.0, y + 1.0 + (chip_h - 3.0 - 2.0 - kh) / 2.0 + 1.0, &style::TEXT);
+            x += kw + 14.0 + GAP_KBD;
+            let (_, th) = g.measure(&g.fonts.ui, t);
+            g.text(&g.fonts.ui, t, x, y + (chip_h - th) / 2.0, &style::TEXT_HINT);
+            x += tw + GAP_ITEM;
+        }
+        y += chip_h + 6.0;
+    }
+}
+
+unsafe fn draw_loupe(g: &Gfx, cursor: Point, origin: Rect, bounds: Rect, frozen: &Image) {
     let l = magnifier::layout(cursor, bounds);
     let nn = D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR;
     let dest = rect_f(l.dest, origin);
     let src = rect_f(l.src, origin);
-    g.rt.DrawBitmap(&g.bitmap, Some(&dest), 1.0, nn, Some(&src));
-    g.brush.SetColor(&WHITE);
-    g.rt.DrawRectangle(&dest, &g.brush, 1.0, None);
-    g.brush.SetColor(&CROSS);
-    g.rt.DrawRectangle(&rect_f(l.cursor_cell, origin), &g.brush, 1.0, None);
-
     let strip = rect_f(l.label, origin);
-    g.brush.SetColor(&LABEL_BG);
-    g.rt.FillRectangle(&strip, &g.brush);
-    let mut text = format!("{}, {}", cursor.x, cursor.y);
-    if let Some(r) = shown {
-        text.push_str(&format!("\n{} \u{d7} {}", r.width, r.height));
+    let panel = D2D_RECT_F { left: dest.left, top: dest.top, right: dest.right, bottom: strip.bottom };
+
+    g.brush.SetColor(&style::PANEL_BG);
+    g.rt.FillRoundedRectangle(&rr(panel, 10.0), &g.brush);
+
+    // Pixel grid, clipped to the panel's rounded top corners.
+    let mask_geo = g.factory.CreateRoundedRectangleGeometry(&rr(panel, 10.0)).ok();
+    let layer = g.rt.CreateLayer(None).ok();
+    let mut pushed = false;
+    if let (Some(geo), Some(layer)) = (mask_geo.as_ref(), layer.as_ref()) {
+        let params = D2D1_LAYER_PARAMETERS {
+            contentBounds: panel,
+            geometricMask: std::mem::ManuallyDrop::new(Some(geo.clone().into())),
+            maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            maskTransform: Matrix3x2::identity(),
+            opacity: 1.0,
+            opacityBrush: std::mem::ManuallyDrop::new(None),
+            layerOptions: D2D1_LAYER_OPTIONS_NONE,
+        };
+        g.rt.PushLayer(&params, layer);
+        // Drop the extra reference we put into the ManuallyDrop mask.
+        std::mem::ManuallyDrop::into_inner(params.geometricMask);
+        pushed = true;
     }
-    g.draw_text(&text, strip.left + 6.0, strip.top + 3.0);
+    g.rt.DrawBitmap(&g.bitmap, Some(&dest), 1.0, nn, Some(&src));
+    // Faint cell borders.
+    g.brush.SetColor(&style::rgba(0x000000, 0.12));
+    let z = magnifier::ZOOM as f32;
+    for i in 1..magnifier::SRC_SIDE {
+        let o = i as f32 * z;
+        g.rt.DrawLine(
+            D2D_POINT_2F { x: dest.left + o - 0.5, y: dest.top },
+            D2D_POINT_2F { x: dest.left + o - 0.5, y: dest.bottom },
+            &g.brush,
+            1.0,
+            None,
+        );
+        g.rt.DrawLine(
+            D2D_POINT_2F { x: dest.left, y: dest.top + o - 0.5 },
+            D2D_POINT_2F { x: dest.right, y: dest.top + o - 0.5 },
+            &g.brush,
+            1.0,
+            None,
+        );
+    }
+    // Crosshair: the cursor cell's row and column, accent at 70 %.
+    let cell = rect_f(l.cursor_cell, origin);
+    g.brush.SetColor(&style::rgba(0x4FC3CF, 0.7));
+    for x in [cell.left + 0.5, cell.right - 0.5] {
+        g.rt.DrawLine(
+            D2D_POINT_2F { x, y: dest.top },
+            D2D_POINT_2F { x, y: dest.bottom },
+            &g.brush,
+            1.0,
+            None,
+        );
+    }
+    for y in [cell.top + 0.5, cell.bottom - 0.5] {
+        g.rt.DrawLine(
+            D2D_POINT_2F { x: dest.left, y },
+            D2D_POINT_2F { x: dest.right, y },
+            &g.brush,
+            1.0,
+            None,
+        );
+    }
+    if pushed {
+        g.rt.PopLayer();
+    }
+
+    g.brush.SetColor(&style::PANEL_BORDER);
+    g.rt.DrawRoundedRectangle(&rr(inset(panel, 0.5), 10.0), &g.brush, 1.0, None);
+
+    // Coordinates, then colour swatch + hex + "C".
+    g.text(&g.fonts.mono_s, &format!("X {} \u{b7} Y {}", cursor.x, cursor.y), strip.left + 8.0, strip.top + 6.0, &style::TEXT);
+    let (_, lh) = g.measure(&g.fonts.mono_s, "0");
+    let y2 = strip.top + 6.0 + lh + 2.0;
+    let (px, py) = (cursor.x - origin.x, cursor.y - origin.y);
+    if px >= 0 && py >= 0 && (px as u32) < frozen.width && (py as u32) < frozen.height {
+        let p = frozen.pixel(px as u32, py as u32);
+        let sw = D2D_RECT_F { left: strip.left + 8.0, top: y2 + (lh - 10.0) / 2.0, right: strip.left + 18.0, bottom: y2 + (lh - 10.0) / 2.0 + 10.0 };
+        g.brush.SetColor(&D2D1_COLOR_F { r: p[0] as f32 / 255.0, g: p[1] as f32 / 255.0, b: p[2] as f32 / 255.0, a: 1.0 });
+        g.rt.FillRoundedRectangle(&rr(sw, 2.0), &g.brush);
+        let hex = hex_color(p);
+        let (hw, _) = g.measure(&g.fonts.mono_s, &hex);
+        g.text(&g.fonts.mono_s, &hex, strip.left + 24.0, y2, &style::TEXT);
+        g.text(&g.fonts.mono_s, "C", strip.left + 24.0 + hw + 6.0, y2, &style::MUTED);
+    }
 }
 
 impl Gfx {
-    unsafe fn layout(&self, text: &str) -> Option<(IDWriteTextLayout, f32, f32)> {
+    /// Text metrics (width, height) for `text` in `format`.
+    unsafe fn measure(&self, format: &IDWriteTextFormat, text: &str) -> (f32, f32) {
+        self.layout(format, text).map(|(_, w, h)| (w, h)).unwrap_or((0.0, 0.0))
+    }
+
+    unsafe fn layout(&self, format: &IDWriteTextFormat, text: &str) -> Option<(IDWriteTextLayout, f32, f32)> {
         let wide: Vec<u16> = text.encode_utf16().collect();
-        let layout = self.dwrite.CreateTextLayout(&wide, &self.format, 2000.0, 200.0).ok()?;
+        let layout = self.dwrite.CreateTextLayout(&wide, format, 2000.0, 200.0).ok()?;
         let mut m = DWRITE_TEXT_METRICS::default();
         layout.GetMetrics(&mut m).ok()?;
         Some((layout, m.width, m.height))
     }
 
-    unsafe fn measure(&self, text: &str) -> Option<(f32, f32)> {
-        self.layout(text).map(|(_, w, h)| (w, h))
-    }
-
-    /// Plain white text with its top-left at (x, y).
-    unsafe fn draw_text(&self, text: &str, x: f32, y: f32) {
-        if let Some((layout, _, _)) = self.layout(text) {
-            self.brush.SetColor(&WHITE);
+    /// Text with its top-left at (x, y).
+    unsafe fn text(&self, format: &IDWriteTextFormat, text: &str, x: f32, y: f32, color: &D2D1_COLOR_F) {
+        if let Some((layout, _, _)) = self.layout(format, text) {
+            self.brush.SetColor(color);
             self.rt.DrawTextLayout(D2D_POINT_2F { x, y }, &layout, &self.brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
-        }
-    }
-
-    /// Text on a dark pill whose top-left is (x, y).
-    unsafe fn label(&self, text: &str, x: f32, y: f32) {
-        if let Some((layout, w, h)) = self.layout(text) {
-            let bg = D2D_RECT_F { left: x, top: y, right: x + w + 12.0, bottom: y + h + 6.0 };
-            self.brush.SetColor(&LABEL_BG);
-            self.rt.FillRectangle(&bg, &self.brush);
-            self.brush.SetColor(&WHITE);
-            self.rt.DrawTextLayout(
-                D2D_POINT_2F { x: x + 6.0, y: y + 3.0 },
-                &layout,
-                &self.brush,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-            );
         }
     }
 }

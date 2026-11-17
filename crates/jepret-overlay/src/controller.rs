@@ -75,6 +75,25 @@ pub fn hint_bar_text() -> &'static str {
      Tab/Shift+Tab: window  \u{b7}  F: monitor ini  \u{b7}  A: semua monitor  \u{b7}  M: magnifier  \u{b7}  C: salin warna  \u{b7}  H: sembunyikan bar"
 }
 
+/// Hint bar content as (key chip, description) pairs, one slice per row.
+pub const HINT_ROWS: [&[(&str, &str)]; 2] = [
+    &[
+        ("Enter", "Ambil"),
+        ("Esc", "Batal"),
+        ("\u{2190}\u{2191}\u{2193}\u{2192}", "Geser 1 px"),
+        ("Ctrl+\u{2190}\u{2191}\u{2193}\u{2192}", "Ubah ukuran"),
+        ("Shift", "\u{d7}10"),
+    ],
+    &[
+        ("Tab", "Window berikutnya"),
+        ("F", "Satu monitor"),
+        ("A", "Semua monitor"),
+        ("M", "Kaca pembesar"),
+        ("C", "Salin warna"),
+        ("H", "Sembunyikan petunjuk"),
+    ],
+];
+
 pub struct Controller {
     sel: Selection,
     /// Window rects clipped to bounds, topmost first (also the Tab order).

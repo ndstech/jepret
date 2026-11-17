@@ -3,9 +3,9 @@
 
 use jepret_core::{Point, Rect};
 
-pub const ZOOM: u32 = 8;
-pub const SRC_SIDE: u32 = 15;
-pub const LABEL_HEIGHT: u32 = 40;
+pub const ZOOM: u32 = 13;
+pub const SRC_SIDE: u32 = 11;
+pub const LABEL_HEIGHT: u32 = 44;
 const OFFSET: i32 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,10 +63,10 @@ mod tests {
     #[test]
     fn centered_in_open_space() {
         let l = layout(Point::new(500, 500), B);
-        assert_eq!(l.src, Rect::new(493, 493, 15, 15));
-        assert_eq!(l.dest, Rect::new(520, 520, 120, 120));
-        assert_eq!(l.label, Rect::new(520, 640, 120, 40));
-        assert_eq!(l.cursor_cell, Rect::new(520 + 7 * 8, 520 + 7 * 8, 8, 8));
+        assert_eq!(l.src, Rect::new(495, 495, 11, 11));
+        assert_eq!(l.dest, Rect::new(520, 520, 143, 143));
+        assert_eq!(l.label, Rect::new(520, 663, 143, 44));
+        assert_eq!(l.cursor_cell, Rect::new(520 + 5 * 13, 520 + 5 * 13, 13, 13));
     }
 
     #[test]
