@@ -441,7 +441,14 @@ fn recording_thread(
     started: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
     let (width, height) = (ro.region.width, ro.region.height);
-    let border = match RegionBorder::show(ro.region) {
+    let stop_hint = cfg
+        .hotkeys
+        .iter()
+        .find(|h| h.capture == kind)
+        .and_then(|h| jepret_core::KeyCombo::parse(&h.keys).ok())
+        .map(|k| format!("{} untuk stop", k.pretty()))
+        .unwrap_or_else(|| "Stop lewat menu tray".to_string());
+    let border = match RegionBorder::show_recording(ro.region, &stop_hint) {
         Ok(b) => Some(b),
         Err(e) => {
             warn!("recording border failed: {e:#}");
