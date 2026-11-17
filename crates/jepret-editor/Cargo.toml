@@ -9,4 +9,15 @@ license.workspace = true
 jepret-core.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-# T06: eframe, egui, image, arboard
+eframe.workspace = true
+egui.workspace = true
+image.workspace = true
+arboard.workspace = true
+# Text rasterisation in render.rs (pure, no egui). egui already depends on both.
+ab_glyph = "0.2"
+epaint_default_fonts = "0.29"
+# Native Save As dialog (IFileDialog on Windows).
+rfd = { version = "0.15", default-features = false }
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
