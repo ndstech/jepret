@@ -10,4 +10,8 @@ jepret-core.workspace = true
 jepret-history.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-# T10: eframe, egui, image
+eframe.workspace = true
+egui.workspace = true
+image.workspace = true
+arboard.workspace = true
+chrono.workspace = true
