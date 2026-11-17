@@ -6,9 +6,13 @@
 //! - `io.rs`: decode / encode / clipboard
 //! - `ui.rs`: egui front-end
 
+#![allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
+
 pub mod doc;
 pub mod io;
 pub mod render;
+pub mod input;
+pub mod session;
 mod ui;
 
 use std::path::Path;
@@ -16,6 +20,7 @@ use std::path::Path;
 use jepret_core::{Config, Result};
 
 pub use doc::{Document, Pt, Shape, ShapeKind, Tool};
+pub use session::{Effect, Session};
 pub use io::{copy_to_clipboard, load_image, save_image};
 pub use render::flatten;
 

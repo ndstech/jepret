@@ -59,6 +59,9 @@ pub fn flatten(base: &Image, doc: &Document) -> Image {
 /// Draw one shape onto `canvas`; `src` supplies original pixels for
 /// blur/pixelate (normally the un-annotated base).
 pub fn draw_shape(canvas: &mut Image, src: &Image, shape: &Shape) {
+    if let Some(sh) = shape.shadow_of() {
+        draw_shape(canvas, src, &sh);
+    }
     let c = shape.color;
     let w = shape.width.max(1.0);
     match &shape.kind {
@@ -94,7 +97,7 @@ pub fn draw_shape(canvas: &mut Image, src: &Image, shape: &Shape) {
                 let qx = (x - cx).abs() - hx;
                 let qy = (y - cy).abs() - hy;
                 let sd = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0);
-                sd.abs() - w / 2.0
+                if shape.fill { sd - w / 2.0 } else { sd.abs() - w / 2.0 }
             });
         }
         ShapeKind::Ellipse { a, b } => {
@@ -111,7 +114,7 @@ pub fn draw_shape(canvas: &mut Image, src: &Image, shape: &Shape) {
                 let g = (gx * gx + gy * gy).sqrt() / f.max(1e-6);
                 // first-order signed distance to the ellipse outline
                 let sd = if g > 1e-9 { (f - 1.0) / g } else { -rx.min(ry) };
-                sd.abs() - w / 2.0
+                if shape.fill { sd - w / 2.0 } else { sd.abs() - w / 2.0 }
             });
         }
         ShapeKind::Highlight { a, b } => {
@@ -584,6 +587,25 @@ mod tests {
         d.add_shape(Shape::new(ShapeKind::Text { pos: Pt::new(-30.0, 5.0), text: "x\ny".into() }, [0, 0, 0, 255], 4.0));
         let out = flatten(&base, &d);
         assert_eq!((out.width, out.height), (10, 10));
+    }
+
+    #[test]
+    fn fill_and_shadow() {
+        let base = solid(60, 60, [255, 255, 255, 255]);
+        let mut d = Document::new();
+        let mut s = Shape::new(
+            ShapeKind::Rect { a: Pt::new(10.0, 10.0), b: Pt::new(40.0, 40.0) },
+            [255, 0, 0, 255],
+            2.0,
+        );
+        s.fill = true;
+        s.shadow = true;
+        d.add_shape(s);
+        let out = flatten(&base, &d);
+        assert_eq!(out.pixel(25, 25), [255, 0, 0, 255]); // filled interior
+        let sh = out.pixel(42, 42); // shadow only
+        assert!(sh[0] < 255 && sh[0] == sh[1], "{sh:?}");
+        assert_eq!(out.pixel(55, 55), [255, 255, 255, 255]);
     }
 
     #[test]

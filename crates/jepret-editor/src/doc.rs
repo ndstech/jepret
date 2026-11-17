@@ -38,10 +38,11 @@ pub enum Tool {
     Pixelate,
     Step,
     Pen,
+    Eyedropper,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 12] = [
+    pub const ALL: [Tool; 13] = [
         Tool::Select,
         Tool::Crop,
         Tool::Arrow,
@@ -54,6 +55,7 @@ impl Tool {
         Tool::Pixelate,
         Tool::Step,
         Tool::Pen,
+        Tool::Eyedropper,
     ];
 
     pub fn label(self) -> &'static str {
@@ -70,23 +72,31 @@ impl Tool {
             Tool::Pixelate => "Pixelate",
             Tool::Step => "Step",
             Tool::Pen => "Pen",
+            Tool::Eyedropper => "Pick color",
         }
     }
 
-    /// Number-key shortcut (1..=9) -> tool.
-    pub fn from_digit(d: u8) -> Option<Tool> {
-        Some(match d {
-            1 => Tool::Select,
-            2 => Tool::Arrow,
-            3 => Tool::Rect,
-            4 => Tool::Ellipse,
-            5 => Tool::Line,
-            6 => Tool::Pen,
-            7 => Tool::Text,
-            8 => Tool::Step,
-            9 => Tool::Blur,
-            _ => return None,
-        })
+    /// Shortcut-catalogue id (`jepret_core::shortcuts`).
+    pub fn id(self) -> &'static str {
+        match self {
+            Tool::Select => "tool.select",
+            Tool::Crop => "tool.crop",
+            Tool::Arrow => "tool.arrow",
+            Tool::Line => "tool.line",
+            Tool::Rect => "tool.rect",
+            Tool::Ellipse => "tool.ellipse",
+            Tool::Text => "tool.text",
+            Tool::Highlight => "tool.highlight",
+            Tool::Blur => "tool.blur",
+            Tool::Pixelate => "tool.pixelate",
+            Tool::Step => "tool.step",
+            Tool::Pen => "tool.pen",
+            Tool::Eyedropper => "tool.eyedropper",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Tool> {
+        Tool::ALL.iter().copied().find(|t| t.id() == id)
     }
 
     /// Default `width` (stroke px / strength / size knob) for new shapes.
@@ -134,14 +144,53 @@ pub struct Shape {
     pub color: Rgba,
     /// Stroke width in px; reinterpreted per kind (see [`ShapeKind`]).
     pub width: f32,
+    /// Filled instead of outline (Rect / Ellipse).
+    pub fill: bool,
+    /// Offset drop shadow.
+    pub shadow: bool,
 }
 
+pub const SHADOW_OFFSET: f32 = 3.0;
+pub const SHADOW_COLOR: Rgba = [0, 0, 0, 100];
 pub const TEXT_PX_PER_WIDTH: f32 = 6.0;
 pub const STEP_RADIUS_PER_WIDTH: f32 = 4.0;
 
 impl Shape {
     pub fn new(kind: ShapeKind, color: Rgba, width: f32) -> Self {
-        Self { kind, color, width }
+        Self { kind, color, width, fill: false, shadow: false }
+    }
+
+    /// The drop-shadow companion shape, if this shape casts one.
+    pub fn shadow_of(&self) -> Option<Shape> {
+        if !self.shadow {
+            return None;
+        }
+        let mut sh = match &self.kind {
+            ShapeKind::Highlight { .. } | ShapeKind::Blur { .. } | ShapeKind::Pixelate { .. } => {
+                return None
+            }
+            ShapeKind::Step { center, .. } => {
+                let r = self.step_radius();
+                let mut s = Shape::new(
+                    ShapeKind::Ellipse {
+                        a: Pt::new(center.x - r, center.y - r),
+                        b: Pt::new(center.x + r, center.y + r),
+                    },
+                    SHADOW_COLOR,
+                    0.0,
+                );
+                s.fill = true;
+                s
+            }
+            _ => {
+                let mut s = self.clone();
+                s.color = SHADOW_COLOR;
+                s
+            }
+        };
+        sh.shadow = false;
+        sh.translate(SHADOW_OFFSET, SHADOW_OFFSET);
+        Some(sh)
     }
 
     pub fn text_px(&self) -> f32 {
@@ -436,6 +485,133 @@ impl Document {
         }
     }
 
+    /// Remove several shapes in one undo step.
+    pub fn remove_shapes(&mut self, idxs: &[usize]) {
+        let mut v: Vec<usize> = idxs.iter().copied().filter(|i| *i < self.cur.shapes.len()).collect();
+        if v.is_empty() {
+            return;
+        }
+        v.sort_unstable();
+        v.dedup();
+        self.begin_edit();
+        for i in v.into_iter().rev() {
+            self.cur.shapes.remove(i);
+        }
+    }
+
+    /// Duplicate shapes (offset by `offset` px, appended on top). Returns the
+    /// new indices. One undo step.
+    pub fn duplicate_shapes(&mut self, idxs: &[usize], offset: f32) -> Vec<usize> {
+        let mut v: Vec<usize> = idxs.iter().copied().filter(|i| *i < self.cur.shapes.len()).collect();
+        v.sort_unstable();
+        v.dedup();
+        if v.is_empty() {
+            return Vec::new();
+        }
+        self.begin_edit();
+        let mut out = Vec::new();
+        for i in v {
+            let mut s = self.cur.shapes[i].clone();
+            s.translate(offset, offset);
+            self.cur.shapes.push(s);
+            out.push(self.cur.shapes.len() - 1);
+        }
+        out
+    }
+
+    /// Move shapes by (dx, dy) in one undo step.
+    pub fn nudge_shapes(&mut self, idxs: &[usize], dx: f32, dy: f32) {
+        if idxs.is_empty() {
+            return;
+        }
+        self.begin_edit();
+        for i in idxs {
+            if let Some(s) = self.cur.shapes.get_mut(*i) {
+                s.translate(dx, dy);
+            }
+        }
+    }
+
+    /// Mutate several shapes in one undo step.
+    pub fn edit_shapes(&mut self, idxs: &[usize], mut f: impl FnMut(&mut Shape)) {
+        let ok: Vec<usize> = idxs.iter().copied().filter(|i| *i < self.cur.shapes.len()).collect();
+        if ok.is_empty() {
+            return;
+        }
+        self.begin_edit();
+        for i in ok {
+            f(&mut self.cur.shapes[i]);
+        }
+    }
+
+    /// Move shapes to the top of the stack (order kept). Returns new indices.
+    pub fn bring_to_front(&mut self, idxs: &[usize]) -> Vec<usize> {
+        self.reorder(idxs, true)
+    }
+
+    /// Move shapes to the bottom of the stack (order kept). Returns new indices.
+    pub fn send_to_back(&mut self, idxs: &[usize]) -> Vec<usize> {
+        self.reorder(idxs, false)
+    }
+
+    fn reorder(&mut self, idxs: &[usize], front: bool) -> Vec<usize> {
+        let n = self.cur.shapes.len();
+        let mut sel: Vec<usize> = idxs.iter().copied().filter(|i| *i < n).collect();
+        sel.sort_unstable();
+        sel.dedup();
+        if sel.is_empty() {
+            return sel;
+        }
+        let k = sel.len();
+        let target: Vec<usize> = if front { (n - k..n).collect() } else { (0..k).collect() };
+        if sel == target {
+            return sel;
+        }
+        self.begin_edit();
+        let shapes = std::mem::take(&mut self.cur.shapes);
+        let (mut picked, mut rest) = (Vec::new(), Vec::new());
+        for (i, s) in shapes.into_iter().enumerate() {
+            if sel.binary_search(&i).is_ok() {
+                picked.push(s);
+            } else {
+                rest.push(s);
+            }
+        }
+        self.cur.shapes = if front {
+            rest.extend(picked);
+            rest
+        } else {
+            picked.extend(rest);
+            picked
+        };
+        target
+    }
+
+    /// Renumber all step shapes 1..n in stacking order. Returns whether
+    /// anything changed (one undo step if so).
+    pub fn reset_steps(&mut self) -> bool {
+        let mut want = 1;
+        let mut changed = false;
+        for s in &self.cur.shapes {
+            if let ShapeKind::Step { n, .. } = s.kind {
+                changed |= n != want;
+                want += 1;
+            }
+        }
+        if !changed {
+            return false;
+        }
+        self.begin_edit();
+        let mut k = 1;
+        for s in &mut self.cur.shapes {
+            if let ShapeKind::Step { n, .. } = &mut s.kind {
+                *n = k;
+                k += 1;
+            }
+        }
+        true
+    }
+
     /// Topmost shape under `p`.
     pub fn hit_test(&self, p: Pt, tol: f32) -> Option<usize> {
         self.cur.shapes.iter().rposition(|s| s.hit(p, tol))
@@ -585,6 +761,87 @@ mod tests {
         d.add_shape(Shape::new(ShapeKind::Step { center: Pt::new(5.0, 5.0), n: 1 }, [0; 4], 4.0));
         d.add_shape(Shape::new(ShapeKind::Step { center: Pt::new(9.0, 9.0), n: 2 }, [0; 4], 4.0));
         assert_eq!(d.next_step_number(), 3);
+    }
+
+    #[test]
+    fn multi_ops_are_single_undo_steps() {
+        let mut d = Document::new();
+        for i in 0..4 {
+            d.add_shape(rect(0.0, 0.0, 1.0 + i as f32, 1.0));
+        }
+        d.remove_shapes(&[0, 2]);
+        assert_eq!(d.shapes().len(), 2);
+        d.undo();
+        assert_eq!(d.shapes().len(), 4);
+        let new = d.duplicate_shapes(&[1, 3], 10.0);
+        assert_eq!(new, vec![4, 5]);
+        assert_eq!(d.shapes()[4].bounds().0, Pt::new(10.0, 10.0));
+        d.undo();
+        assert_eq!(d.shapes().len(), 4);
+        d.nudge_shapes(&[0, 1], 2.0, 3.0);
+        assert_eq!(d.shapes()[1].bounds().0, Pt::new(2.0, 3.0));
+        d.undo();
+        assert_eq!(d.shapes()[1].bounds().0, Pt::new(0.0, 0.0));
+    }
+
+    #[test]
+    fn layer_order() {
+        let mut d = Document::new();
+        for i in 0..4 {
+            d.add_shape(rect(0.0, 0.0, 10.0 * (i + 1) as f32, 1.0));
+        }
+        let w = |d: &Document| -> Vec<i32> { d.shapes().iter().map(|s| s.bounds().1.x as i32).collect() };
+        let new = d.bring_to_front(&[0, 1]);
+        assert_eq!(w(&d), vec![30, 40, 10, 20]);
+        assert_eq!(new, vec![2, 3]);
+        let new = d.send_to_back(&[3]);
+        assert_eq!(w(&d), vec![20, 30, 40, 10]);
+        assert_eq!(new, vec![0]);
+        // already at front: no undo step
+        let before = d.revision();
+        d.bring_to_front(&[3]);
+        assert_eq!(d.revision(), before);
+    }
+
+    #[test]
+    fn reset_steps_renumbers() {
+        let mut d = Document::new();
+        for n in [3, 7, 9] {
+            d.add_shape(Shape::new(ShapeKind::Step { center: Pt::new(1.0, 1.0), n }, [0; 4], 4.0));
+        }
+        assert!(d.reset_steps());
+        let ns: Vec<u32> = d
+            .shapes()
+            .iter()
+            .filter_map(|s| match s.kind {
+                ShapeKind::Step { n, .. } => Some(n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ns, vec![1, 2, 3]);
+        assert!(!d.reset_steps());
+        d.undo();
+        assert_eq!(d.next_step_number(), 10);
+    }
+
+    #[test]
+    fn shadow_companion() {
+        let mut s = rect(10.0, 10.0, 20.0, 20.0);
+        assert!(s.shadow_of().is_none());
+        s.shadow = true;
+        let sh = s.shadow_of().unwrap();
+        assert_eq!(sh.bounds().0, Pt::new(13.0, 13.0));
+        assert!(!sh.shadow);
+        let mut hl = Shape::new(ShapeKind::Highlight { a: Pt::new(0.0, 0.0), b: Pt::new(5.0, 5.0) }, [0; 4], 1.0);
+        hl.shadow = true;
+        assert!(hl.shadow_of().is_none());
+    }
+
+    #[test]
+    fn tool_ids_roundtrip() {
+        for t in Tool::ALL {
+            assert_eq!(Tool::from_id(t.id()), Some(t));
+        }
     }
 
     #[test]
