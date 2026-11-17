@@ -21,13 +21,17 @@ fn body() -> FontId {
 /// Keyboard chip, e.g. `Ctrl+PrtSc`. Pass `KeyCombo::pretty()` output.
 pub fn kbd(ui: &mut Ui, pal: &Palette, text: &str) -> Response {
     let font = mono(TEXT_KBD);
-    let size = text_size(ui, text, &font) + Vec2::new(12.0, 6.0);
+    // Mockup: padding 1px 6px, border 1px with a 2px bottom border, radius 4.
+    let tsz = text_size(ui, text, &font);
+    let size = Vec2::new(tsz.x + 12.0 + 2.0, tsz.y + 2.0 + 3.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
     let p = ui.painter();
-    // 2 px bottom border look: darker rect offset under the chip.
-    p.rect_filled(rect.translate(Vec2::new(0.0, 1.0)), RADIUS_KBD, pal.line_strong);
-    p.rect(rect, RADIUS_KBD, pal.kbd_bg, Stroke::new(1.0_f32, pal.line_strong));
-    p.text(rect.center(), Align2::CENTER_CENTER, text, font, pal.text);
+    // Border colour fills the whole chip; the face is inset 1 px (sides/top)
+    // and 2 px (bottom), which yields the thicker bottom edge.
+    p.rect_filled(rect, RADIUS_KBD, pal.line_strong);
+    let face = Rect::from_min_max(rect.min + Vec2::new(1.0, 1.0), rect.max - Vec2::new(1.0, 2.0));
+    p.rect_filled(face, RADIUS_KBD - 1.0, pal.kbd_bg);
+    p.text(face.center(), Align2::CENTER_CENTER, text, font, pal.text);
     resp
 }
 
@@ -43,27 +47,42 @@ fn button_impl(ui: &mut Ui, pal: &Palette, label: &str, shortcut: Option<&str>, 
     let sc_sz = shortcut.map(|s| text_size(ui, s, &sc_font)).unwrap_or(Vec2::ZERO);
     let icon_w = if icon.is_some() { 16.0 + SP_2 } else { 0.0 };
     let gap = if shortcut.is_some() { SP_2 } else { 0.0 };
-    let w = 12.0 + icon_w + label_sz.x + gap + sc_sz.x + 12.0;
+    // Mockup: height 32, padding 0 14 (icon buttons 0 12), gap 8, radius 8.
+    let pad = if icon.is_some() { 12.0 } else { 14.0 };
+    let w = pad + icon_w + label_sz.x + gap + sc_sz.x + pad;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, CONTROL_H), Sense::click());
     let hovered = resp.hovered();
+    let pressed = resp.is_pointer_button_down_on();
     let (fill, stroke, fg, sc_col) = if primary {
-        let fill = if hovered { pal.accent.gamma_multiply(0.9) } else { pal.accent };
+        let fill = if pressed {
+            pal.accent.gamma_multiply(0.8)
+        } else if hovered {
+            pal.accent.gamma_multiply(0.9)
+        } else {
+            pal.accent
+        };
         (fill, Stroke::NONE, pal.on_accent, pal.on_accent.gamma_multiply(0.8))
     } else {
-        let fill = if hovered { pal.raised } else { pal.surface };
+        let fill = if pressed {
+            pal.accent_soft
+        } else if hovered {
+            pal.raised
+        } else {
+            pal.surface
+        };
         (fill, Stroke::new(1.0_f32, pal.line_strong), pal.text, pal.muted)
     };
     let p = ui.painter();
     p.rect(rect, RADIUS_CONTROL, fill, stroke);
-    let mut x = rect.left() + 12.0;
+    let mut x = rect.left() + pad;
     if let Some(ic) = icon {
         let r = Rect::from_center_size(egui::pos2(x + 8.0, rect.center().y), Vec2::splat(16.0));
-        icons::paint(p, r, ic, fg, 1.75);
+        icons::paint(p, r, ic, fg, 2.0);
         x += icon_w;
     }
     p.text(egui::pos2(x, rect.center().y), Align2::LEFT_CENTER, label, font, fg);
     if let Some(s) = shortcut {
-        p.text(egui::pos2(rect.right() - 12.0, rect.center().y), Align2::RIGHT_CENTER, s, sc_font, sc_col);
+        p.text(egui::pos2(rect.right() - pad, rect.center().y), Align2::RIGHT_CENTER, s, sc_font, sc_col);
     }
     if resp.has_focus() {
         p.rect_stroke(rect.expand(2.0), RADIUS_CONTROL + 2.0, Stroke::new(2.0_f32, pal.accent));
@@ -203,7 +222,11 @@ pub fn segmented(ui: &mut Ui, pal: &Palette, selected: &mut usize, options: &[&s
         }
         let on = *selected == i;
         if on {
-            p.rect(seg, RADIUS_CONTROL - 2.0, pal.surface, Stroke::new(1.0_f32, pal.line));
+            // White pill with a faint drop shadow (mockup: 0 1px 2px / 8%).
+            p.rect_filled(seg.translate(Vec2::new(0.0, 1.0)), 6.0, Color32::from_black_alpha(if pal.dark { 60 } else { 20 }));
+            p.rect_filled(seg, 6.0, pal.surface);
+        } else if r.hovered() {
+            p.rect_filled(seg, 6.0, pal.line.gamma_multiply(0.5));
         }
         let col = if on { pal.text } else { pal.muted };
         p.text(seg.center(), Align2::CENTER_CENTER, *opt, font.clone(), col);
