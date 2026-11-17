@@ -209,8 +209,236 @@ pub fn grid_columns(avail_width: f32, cell_w: f32, spacing: f32) -> usize {
     (((avail_width + spacing) / (cell_w + spacing)).floor() as usize).max(1)
 }
 
-pub fn grid_rows(total: u64, cols: usize) -> usize {
-    (total as usize).div_ceil(cols.max(1))
+// ------------------------------------------------- Day groups & layout
+
+/// A run of consecutive entries created on the same local day.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DayRun {
+    pub day: NaiveDate,
+    /// Absolute index of the first entry in the run.
+    pub start: u64,
+    pub count: u64,
+}
+
+/// Local calendar day of a unix-millis timestamp.
+pub fn local_day(ms: i64) -> NaiveDate {
+    Local
+        .timestamp_millis_opt(ms)
+        .earliest()
+        .map(|d| d.date_naive())
+        .unwrap_or(NaiveDate::MIN)
+}
+
+/// Append one entry (newest first) to `runs`, extending the last run if same day.
+pub fn push_day(runs: &mut Vec<DayRun>, day: NaiveDate) {
+    match runs.last_mut() {
+        Some(r) if r.day == day => r.count += 1,
+        _ => {
+            let start = runs.last().map(|r| r.start + r.count).unwrap_or(0);
+            runs.push(DayRun { day, start, count: 1 });
+        }
+    }
+}
+
+const MONTHS_ID: [&str; 12] = [
+    "Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus", "September",
+    "Oktober", "November", "Desember",
+];
+
+/// "Hari ini", "Kemarin", otherwise "18 November 2026".
+pub fn day_label(day: NaiveDate, today: NaiveDate) -> String {
+    use chrono::Datelike;
+    if day == today {
+        "Hari ini".into()
+    } else if today.pred_opt() == Some(day) {
+        "Kemarin".into()
+    } else {
+        format!("{} {} {}", day.day(), MONTHS_ID[day.month0() as usize], day.year())
+    }
+}
+
+/// Human label for `Entry::source` (snake_case `CaptureKind` or "recording").
+pub fn source_label(source: &str) -> String {
+    match source {
+        "region" => "Region".into(),
+        "fullscreen" => "Fullscreen".into(),
+        "active_monitor" => "Monitor".into(),
+        "active_window" => "Window".into(),
+        "last_region" => "Last region".into(),
+        "scroll" => "Scroll".into(),
+        "record_region" | "record_monitor" | "recording" => "Rekam".into(),
+        "" => "Capture".into(),
+        other => {
+            let mut c = other.replace('_', " ").chars().collect::<Vec<_>>();
+            if let Some(f) = c.first_mut() {
+                *f = f.to_ascii_uppercase();
+            }
+            c.into_iter().collect()
+        }
+    }
+}
+
+/// `1284` -> "1.284".
+pub fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push('.');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// "3,2 GB" / "380 MB" / "12 KB" (decimal comma).
+pub fn human_bytes(b: u64) -> String {
+    const MB: f64 = 1_048_576.0;
+    let f = b as f64;
+    if f >= 1024.0 * MB {
+        format!("{:.1} GB", f / (1024.0 * MB)).replace('.', ",")
+    } else if f >= MB {
+        format!("{:.0} MB", f / MB)
+    } else {
+        format!("{:.0} KB", f / 1024.0)
+    }
+}
+
+/// Toast text for a finished cleanup.
+pub fn cleanup_summary(r: &jepret_history::CleanupReport, recycle: bool, keep_favorites: bool) -> String {
+    let mut s = if r.files_deleted == 0 && r.entries_removed == 0 {
+        "Cleanup selesai: tidak ada yang perlu dibersihkan".to_string()
+    } else {
+        format!(
+            "Cleanup selesai: {} file · {} {}",
+            r.files_deleted,
+            human_bytes(r.bytes_freed),
+            if recycle { "dipindah ke Recycle Bin" } else { "dihapus" }
+        )
+    };
+    if keep_favorites {
+        s.push_str(" · favorit aman");
+    }
+    if !r.errors.is_empty() {
+        s.push_str(&format!(" · {} error ({})", r.errors.len(), r.errors[0]));
+    }
+    s
+}
+/// One vertical slot in the virtual grid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Row {
+    Header { run: usize, start: u64 },
+    /// `count` cards starting at absolute index `start`, belonging to `run`.
+    Cards { run: usize, start: u64, count: usize },
+}
+
+/// Row geometry for the virtualized, grouped grid.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GridLayout {
+    pub cols: usize,
+    pub rows: Vec<Row>,
+    /// Top y of each row; `tops.len() == rows.len()`.
+    pub tops: Vec<f32>,
+    pub height: f32,
+}
+
+impl GridLayout {
+    pub fn build(runs: &[DayRun], cols: usize, header_h: f32, row_h: f32) -> Self {
+        let cols = cols.max(1);
+        let mut rows = Vec::new();
+        let mut tops = Vec::new();
+        let mut y = 0.0_f32;
+        for (ri, run) in runs.iter().enumerate() {
+            rows.push(Row::Header { run: ri, start: run.start });
+            tops.push(y);
+            y += header_h;
+            let mut done = 0u64;
+            while done < run.count {
+                let n = (run.count - done).min(cols as u64) as usize;
+                rows.push(Row::Cards { run: ri, start: run.start + done, count: n });
+                tops.push(y);
+                y += row_h;
+                done += n as u64;
+            }
+        }
+        Self { cols, rows, tops, height: y }
+    }
+
+    fn row_height(&self, i: usize) -> f32 {
+        self.tops.get(i + 1).copied().unwrap_or(self.height) - self.tops[i]
+    }
+
+    /// Rows intersecting the vertical span `[y0, y1]`.
+    pub fn visible(&self, y0: f32, y1: f32) -> std::ops::Range<usize> {
+        let first = self.tops.partition_point(|t| *t <= y0).saturating_sub(1);
+        let last = self.tops.partition_point(|t| *t < y1);
+        first.min(self.rows.len())..last.max(first).min(self.rows.len())
+    }
+
+    /// (row index, top, height) of the card row holding entry `idx`.
+    pub fn row_of(&self, idx: u64) -> Option<(usize, f32, f32)> {
+        let i = self.rows.partition_point(|r| match r {
+            Row::Cards { start, .. } | Row::Header { start, .. } => *start <= idx,
+        });
+        let i = i.checked_sub(1)?;
+        match self.rows.get(i)? {
+            Row::Cards { start, count, .. } if idx < start + *count as u64 => {
+                Some((i, self.tops[i], self.row_height(i)))
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Keyboard navigation over the grouped grid. Rows never mix days, so
+/// Up/Down keep the column and clamp to the last card of the target row.
+pub fn move_selection(runs: &[DayRun], cols: usize, idx: u64, dir: Dir) -> u64 {
+    let cols = cols.max(1) as u64;
+    let total = runs.last().map(|r| r.start + r.count).unwrap_or(0);
+    if total == 0 {
+        return 0;
+    }
+    let idx = idx.min(total - 1);
+    match dir {
+        Dir::Left => idx.saturating_sub(1),
+        Dir::Right => (idx + 1).min(total - 1),
+        Dir::Up | Dir::Down => {
+            let ri = runs.partition_point(|r| r.start <= idx).saturating_sub(1);
+            let run = &runs[ri];
+            let rel = idx - run.start;
+            let (row, col) = (rel / cols, rel % cols);
+            let rows_in_run = run.count.div_ceil(cols);
+            // card at (row, col) of `run`, clamped to the row's last card
+            let target = |run: &DayRun, row: u64| {
+                let first = row * cols;
+                run.start + (first + col).min(run.count - 1).max(first)
+            };
+            if dir == Dir::Up {
+                if row > 0 {
+                    target(run, row - 1)
+                } else if ri > 0 {
+                    let prev = &runs[ri - 1];
+                    target(prev, prev.count.div_ceil(cols) - 1)
+                } else {
+                    idx
+                }
+            } else if row + 1 < rows_in_run {
+                target(run, row + 1)
+            } else if ri + 1 < runs.len() {
+                target(&runs[ri + 1], 0)
+            } else {
+                idx
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -374,8 +602,90 @@ mod tests {
         assert_eq!(grid_columns(100.0, 200.0, 8.0), 1);
         assert_eq!(grid_columns(1000.0, 200.0, 8.0), 4);
         assert_eq!(grid_columns(1040.0, 200.0, 8.0), 5);
-        assert_eq!(grid_rows(10_000, 5), 2000);
-        assert_eq!(grid_rows(10, 4), 3);
-        assert_eq!(grid_rows(0, 4), 0);
+
+
     }
-}
+
+    fn day(d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 11, d).unwrap()
+    }
+
+    fn runs_of(counts: &[(u32, u64)]) -> Vec<DayRun> {
+        let mut v = Vec::new();
+        for (d, c) in counts {
+            for _ in 0..*c {
+                push_day(&mut v, day(*d));
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn day_runs_group_consecutive_days() {
+        let r = runs_of(&[(18, 3), (17, 2)]);
+        assert_eq!(r.len(), 2);
+        assert_eq!((r[1].start, r[1].count), (3, 2));
+    }
+
+    #[test]
+    fn day_labels() {
+        assert_eq!(day_label(day(18), day(18)), "Hari ini");
+        assert_eq!(day_label(day(17), day(18)), "Kemarin");
+        assert_eq!(day_label(day(3), day(18)), "3 November 2026");
+    }
+
+    #[test]
+    fn formats() {
+        assert_eq!(thousands(1284), "1.284");
+        assert_eq!(thousands(12), "12");
+        assert_eq!(thousands(1_000_000), "1.000.000");
+        assert_eq!(human_bytes(3_435_973_837), "3,2 GB");
+        assert_eq!(human_bytes(398_458_880), "380 MB");
+        assert_eq!(source_label("active_window"), "Window");
+        assert_eq!(source_label("foo_bar"), "Foo bar");
+    }
+
+    #[test]
+    fn layout_rows_and_visibility() {
+        let runs = runs_of(&[(18, 7), (17, 2)]);
+        let l = GridLayout::build(&runs, 3, 30.0, 100.0);
+        // header, 3 card rows (3+3+1), header, 1 card row
+        assert_eq!(l.rows.len(), 6);
+        assert_eq!(l.height, 30.0 + 300.0 + 30.0 + 100.0);
+        assert_eq!(l.visible(0.0, 10.0), 0..1);
+        assert_eq!(l.visible(35.0, 150.0), 1..3);
+        assert_eq!(l.row_of(6).map(|r| r.0), Some(3));
+        assert_eq!(l.row_of(7).map(|r| r.0), Some(5));
+        assert!(l.row_of(9).is_none());
+    }
+
+    #[test]
+    fn selection_moves_across_groups() {
+        let runs = runs_of(&[(18, 7), (17, 2)]);
+        let m = |i, d| move_selection(&runs, 3, i, d);
+        assert_eq!(m(0, Dir::Left), 0);
+        assert_eq!(m(0, Dir::Right), 1);
+        assert_eq!(m(1, Dir::Down), 4);
+        assert_eq!(m(5, Dir::Down), 6); // clamps to last card of short row
+        assert_eq!(m(6, Dir::Down), 7); // next group, first row, col 0
+        assert_eq!(m(8, Dir::Up), 6); // col 2 -> clamp to last card of last row
+        assert_eq!(m(7, Dir::Up), 6);
+        assert_eq!(m(8, Dir::Right), 8);
+        assert_eq!(m(1, Dir::Up), 1);
+    }
+
+    #[test]
+    fn cleanup_text() {
+        let r = jepret_history::CleanupReport {
+            files_deleted: 42,
+            bytes_freed: 398_458_880,
+            entries_removed: 42,
+            errors: vec![],
+        };
+        assert_eq!(
+            cleanup_summary(&r, true, true),
+            "Cleanup selesai: 42 file · 380 MB dipindah ke Recycle Bin · favorit aman"
+        );
+        let none = jepret_history::CleanupReport::default();
+        assert!(cleanup_summary(&none, false, false).contains("tidak ada"));
+    }}
