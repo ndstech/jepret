@@ -30,6 +30,7 @@ use std::{
 
 use anyhow::Context as _;
 use jepret_core::{paths, Action, CaptureKind, Config};
+use jepret_ui_theme::Icon;
 use tracing::{debug, error, info, warn};
 use windows::{
     core::{w, PCWSTR},
@@ -38,7 +39,10 @@ use windows::{
             CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, LRESULT, POINT,
             WAIT_OBJECT_0, WPARAM,
         },
-        Graphics::Gdi::{CreateBitmap, DeleteObject, HGDIOBJ},
+        Graphics::Gdi::{
+            CreateBitmap, CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP,
+            HGDIOBJ,
+        },
         Storage::FileSystem::{
             FindCloseChangeNotification, FindFirstChangeNotificationW, FindNextChangeNotification,
             FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
@@ -53,6 +57,7 @@ use windows::{
             Threading::{CreateMutexW, INFINITE},
         },
         UI::{
+            HiDpi::{GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi},
             Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT},
             Shell::{
                 ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR,
@@ -67,7 +72,7 @@ use windows::{
 use crate::{
     command::{self, Command},
     dispatch::{self, Ctx},
-    hotkey,
+    hotkey, raster,
 };
 
 const CLASS_NAME: PCWSTR = w!("Jepret.Daemon.Wnd");
@@ -141,8 +146,8 @@ pub fn run() -> anyhow::Result<()> {
     *state() = Some(Daemon {
         config: config.clone(),
         registered: Vec::new(),
-        icon_idle: make_icon(false),
-        icon_rec: make_icon(true),
+        icon_idle: 0,
+        icon_rec: 0,
     });
 
     let _ = dispatch::STATE_HOOK.set(|| {
@@ -155,6 +160,12 @@ pub fn run() -> anyhow::Result<()> {
 
     let window = create_window()?;
     HWND_RAW.store(window.0 as isize, Ordering::Release);
+    // Icons depend on the window's DPI and the taskbar theme, so build them now.
+    let (idle, rec) = make_tray_icons();
+    if let Some(d) = state().as_mut() {
+        d.icon_idle = idle;
+        d.icon_rec = rec;
+    }
     add_tray_icon(window, false);
 
     if let Some(e) = config_err {
@@ -346,50 +357,107 @@ fn update_tray(recording: bool) {
     }
 }
 
-/// 32x32 RGBA tray icon: filled disc with a lens ring. Pure; see tests.
-fn icon_pixels(recording: bool) -> Vec<u8> {
-    const N: i32 = 32;
-    let (r, g, b) = if recording { (0xE5, 0x39, 0x35) } else { (0x1E, 0x88, 0xE5) };
-    let mut px = vec![0u8; (N * N * 4) as usize];
-    for y in 0..N {
-        for x in 0..N {
-            let (dx, dy) = (x as f32 + 0.5 - 16.0, y as f32 + 0.5 - 16.0);
-            let d = (dx * dx + dy * dy).sqrt();
-            let i = ((y * N + x) * 4) as usize;
-            let (cr, cg, cb, a) = if d <= 6.0 {
-                (255, 255, 255, 255)
-            } else if d <= 9.0 {
-                (r, g, b, 255)
-            } else if d <= 10.5 {
-                (255, 255, 255, 255)
-            } else if d <= 15.0 {
-                (r, g, b, 255)
-            } else {
-                (0, 0, 0, 0)
-            };
-            // BGRA, as CreateIconIndirect expects for 32bpp.
-            px[i] = cb;
-            px[i + 1] = cg;
-            px[i + 2] = cr;
-            px[i + 3] = a;
-        }
+/// Tray icon edge in pixels for the DPI of the window the tray belongs to.
+fn tray_icon_size() -> u32 {
+    // SAFETY: plain metric queries; the window handle may be null (then system DPI).
+    let px = unsafe {
+        let h = hwnd();
+        let dpi = if h.0.is_null() { GetDpiForSystem() } else { GetDpiForWindow(h) };
+        GetSystemMetricsForDpi(SM_CXSMICON, if dpi == 0 { 96 } else { dpi })
+    };
+    if px > 0 {
+        px as u32
+    } else {
+        16
     }
-    px
 }
 
-fn make_icon(recording: bool) -> isize {
-    let px = icon_pixels(recording);
-    let mask = [0u8; 32 * 4];
-    // SAFETY: buffers outlive the CreateBitmap calls (they copy the bits); the
+/// `SystemUsesLightTheme` (taskbar/tray theme); defaults to dark when unreadable.
+fn taskbar_is_light() -> bool {
+    let mut data = 0u32;
+    let mut size = 4u32;
+    // SAFETY: reads a DWORD into a properly sized local buffer.
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
+            w!("SystemUsesLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut data as *mut u32 as *mut _),
+            Some(&mut size),
+        )
+    };
+    r.is_ok() && data == 1
+}
+
+/// Build an `HBITMAP` from straight RGBA (`premultiply` for menu bitmaps).
+fn bitmap_from_rgba(rgba: &[u8], size: u32, premultiply: bool) -> Option<HBITMAP> {
+    let bgra = raster::rgba_to_bgra(rgba, premultiply);
+    let bi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: size as i32,
+        biHeight: -(size as i32), // top-down
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB.0,
+        ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: CreateDIBSection returns a pointer to `size*size*4` bytes we own
+    // for the bitmap's lifetime; we copy exactly that many bytes into it.
+    unsafe {
+        let bmp = CreateDIBSection(None, &bi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+        if bits.is_null() || bgra.len() != (size * size * 4) as usize {
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            return None;
+        }
+        std::ptr::copy_nonoverlapping(bgra.as_ptr(), bits as *mut u8, bgra.len());
+        Some(bmp)
+    }
+}
+
+fn make_icon(recording: bool, size: u32, light: bool) -> isize {
+    let px = raster::tray_icon_rgba(size, recording, light);
+    let mask = vec![0u8; (size.div_ceil(16) * 2 * size) as usize];
+    let Some(color) = bitmap_from_rgba(&px, size, false) else { return 0 };
+    // SAFETY: the mask buffer outlives CreateBitmap (which copies it); both
     // bitmaps are deleted after CreateIconIndirect copied them.
     unsafe {
-        let color = CreateBitmap(32, 32, 1, 32, Some(px.as_ptr() as *const _));
-        let mask_bmp = CreateBitmap(32, 32, 1, 1, Some(mask.as_ptr() as *const _));
+        let mask_bmp = CreateBitmap(size as i32, size as i32, 1, 1, Some(mask.as_ptr() as *const _));
         let info = ICONINFO { fIcon: true.into(), xHotspot: 0, yHotspot: 0, hbmMask: mask_bmp, hbmColor: color };
         let icon = CreateIconIndirect(&info).map(|i| i.0 as isize).unwrap_or(0);
         let _ = DeleteObject(HGDIOBJ(color.0));
         let _ = DeleteObject(HGDIOBJ(mask_bmp.0));
         icon
+    }
+}
+
+fn make_tray_icons() -> (isize, isize) {
+    let (size, light) = (tray_icon_size(), taskbar_is_light());
+    (make_icon(false, size, light), make_icon(true, size, light))
+}
+
+/// Rebuild tray icons after a DPI / taskbar-theme change and push them to the shell.
+fn refresh_tray_icons() {
+    let (idle, rec) = make_tray_icons();
+    if idle == 0 || rec == 0 {
+        return;
+    }
+    let old = {
+        let mut st = state();
+        st.as_mut().map(|d| (std::mem::replace(&mut d.icon_idle, idle), std::mem::replace(&mut d.icon_rec, rec)))
+    };
+    update_tray(dispatch::is_recording());
+    if let Some((a, b)) = old {
+        // SAFETY: the shell already switched to the new icon handles above.
+        unsafe {
+            let _ = DestroyIcon(HICON(a as *mut _));
+            let _ = DestroyIcon(HICON(b as *mut _));
+        }
     }
 }
 
@@ -588,6 +656,19 @@ fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> 
             unsafe { PostQuitMessage(0) };
             Some(LRESULT(0))
         }
+        WM_DPICHANGED | WM_DISPLAYCHANGE => {
+            refresh_tray_icons();
+            None
+        }
+        WM_SETTINGCHANGE => {
+            // "ImmersiveColorSet" = light/dark switch.
+            // SAFETY: lParam is a NUL-terminated wide string or null per the message contract.
+            let name = unsafe { PCWSTR(lp.0 as *const u16).to_string().unwrap_or_default() };
+            if name == "ImmersiveColorSet" {
+                refresh_tray_icons();
+            }
+            None
+        }
         m if m != 0 && m == TASKBAR_CREATED.load(Ordering::Relaxed) => {
             add_tray_icon(h, dispatch::is_recording());
             Some(LRESULT(0))
@@ -765,48 +846,84 @@ fn reload_config(h: HWND) {
 
 // ---------------------------------------------------------------- menu
 
+/// One tray-menu row.
+enum Row {
+    Sep,
+    /// `(id, label, shortcut kind, icon)`
+    Item(usize, &'static str, Option<CaptureKind>, MenuGlyph),
+}
+
+#[derive(Clone, Copy)]
+enum MenuGlyph {
+    Path(Icon),
+    Stop,
+}
+
+fn kind_id(kind: CaptureKind) -> usize {
+    ID_KIND_BASE + command::KIND_NAMES.iter().position(|(_, k)| *k == kind).unwrap_or(0)
+}
+
+/// Menu order of the design ("Tray" artboard); the record row flips to "Stop rekaman".
+fn menu_rows(recording: bool) -> Vec<Row> {
+    use CaptureKind as K;
+    let rec = if recording {
+        Row::Item(ID_STOP_REC, "Stop rekaman", Some(K::RecordRegion), MenuGlyph::Stop)
+    } else {
+        Row::Item(kind_id(K::RecordRegion), "Rekam region", Some(K::RecordRegion), MenuGlyph::Path(Icon::Record))
+    };
+    vec![
+        Row::Item(kind_id(K::Region), "Region", Some(K::Region), MenuGlyph::Path(Icon::Frame)),
+        Row::Item(kind_id(K::Fullscreen), "Fullscreen", Some(K::Fullscreen), MenuGlyph::Path(Icon::Monitor)),
+        Row::Item(kind_id(K::ActiveWindow), "Window aktif", Some(K::ActiveWindow), MenuGlyph::Path(Icon::Window)),
+        Row::Item(kind_id(K::LastRegion), "Last region", Some(K::LastRegion), MenuGlyph::Path(Icon::History)),
+        Row::Item(kind_id(K::Scroll), "Scroll capture", Some(K::Scroll), MenuGlyph::Path(Icon::Scroll)),
+        Row::Sep,
+        rec,
+        Row::Sep,
+        Row::Item(ID_GALLERY, "Galeri", None, MenuGlyph::Path(Icon::Gallery)),
+        Row::Item(ID_SETTINGS, "Settings", None, MenuGlyph::Path(Icon::Settings)),
+        Row::Item(ID_OPEN_FOLDER, "Buka folder output", None, MenuGlyph::Path(Icon::Folder)),
+        Row::Sep,
+        Row::Item(ID_QUIT, "Keluar", None, MenuGlyph::Path(Icon::Exit)),
+    ]
+}
+
 fn show_menu(h: HWND) {
     let recording = dispatch::is_recording();
-    // SAFETY: menu creation/tracking on the window's own thread.
+    let cfg = state().as_ref().map(|d| d.config.clone());
+    let icon_px = tray_icon_size();
+    let mut bitmaps: Vec<HBITMAP> = Vec::new();
+    // SAFETY: menu creation/tracking on the window's own thread; the bitmaps
+    // are deleted only after the menu that references them is destroyed.
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
-        let (Ok(cap), Ok(rec)) = (CreatePopupMenu(), CreatePopupMenu()) else {
-            let _ = DestroyMenu(menu);
-            return;
-        };
-        let labels = [
-            "Fullscreen",
-            "Monitor aktif",
-            "Window aktif",
-            "Region",
-            "Region terakhir",
-            "Scroll capture",
-            "Rekam region",
-            "Rekam monitor aktif",
-        ];
-        let cfg = state().as_ref().map(|d| d.config.clone());
-        for (i, label) in labels.iter().enumerate() {
-            let target = if i < 6 { cap } else { rec };
-            let kind = command::KIND_NAMES[i].1;
-            let text = match cfg.as_deref().and_then(|c| shortcut_label(c, kind)) {
-                Some(sc) => format!("{label}	{sc}"),
-                None => (*label).to_string(),
+        for row in menu_rows(recording) {
+            let Row::Item(id, label, kind, glyph) = row else {
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+                continue;
             };
-            let _ = AppendMenuW(target, MF_STRING, ID_KIND_BASE + i, PCWSTR(wide(&text).as_ptr()));
+            let text = match kind.and_then(|k| cfg.as_deref().and_then(|c| shortcut_label(c, k))) {
+                Some(sc) => format!("{label}\t{sc}"),
+                None => label.to_string(),
+            };
+            let _ = AppendMenuW(menu, MF_STRING, id, PCWSTR(wide(&text).as_ptr()));
+            let red = id == ID_STOP_REC || id == kind_id(CaptureKind::RecordRegion);
+            let color = if red { [0xD9, 0x3A, 0x2B] } else { raster::TRAY_DARK_ON_LIGHT };
+            let rgba = match glyph {
+                MenuGlyph::Path(i) => raster::menu_icon_rgba(icon_px, i.path(), color),
+                MenuGlyph::Stop => raster::stop_icon_rgba(icon_px, color),
+            };
+            if let Some(bmp) = bitmap_from_rgba(&rgba, icon_px, true) {
+                let mii = MENUITEMINFOW {
+                    cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                    fMask: MIIM_BITMAP,
+                    hbmpItem: bmp,
+                    ..Default::default()
+                };
+                let _ = SetMenuItemInfoW(menu, id as u32, false, &mii);
+                bitmaps.push(bmp);
+            }
         }
-        let _ = AppendMenuW(menu, MF_POPUP, cap.0 as usize, w!("Capture"));
-        if recording {
-            let _ = AppendMenuW(menu, MF_STRING, ID_STOP_REC, w!("Stop rekaman"));
-            let _ = DestroyMenu(rec);
-        } else {
-            let _ = AppendMenuW(menu, MF_POPUP, rec.0 as usize, w!("Record"));
-        }
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(menu, MF_STRING, ID_GALLERY, w!("Galeri"));
-        let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, w!("Settings"));
-        let _ = AppendMenuW(menu, MF_STRING, ID_OPEN_FOLDER, w!("Buka folder output"));
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(menu, MF_STRING, ID_QUIT, w!("Keluar"));
 
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
@@ -814,7 +931,10 @@ fn show_menu(h: HWND) {
         let _ = SetForegroundWindow(h);
         let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, h, None);
         let _ = PostMessageW(h, WM_NULL, WPARAM(0), LPARAM(0));
-        let _ = DestroyMenu(menu); // also destroys attached submenus
+        let _ = DestroyMenu(menu);
+        for b in bitmaps {
+            let _ = DeleteObject(HGDIOBJ(b.0));
+        }
     }
 }
 
@@ -948,17 +1068,6 @@ fn apply_autostart(config: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn icon_has_expected_size_and_transparent_corner() {
-        for rec in [false, true] {
-            let px = icon_pixels(rec);
-            assert_eq!(px.len(), 32 * 32 * 4);
-            assert_eq!(px[3], 0, "corner pixel must be transparent");
-            let center = (16 * 32 + 16) * 4;
-            assert_eq!(px[center + 3], 255);
-        }
-    }
 
     #[test]
     fn copy_utf16_truncates_and_terminates() {
