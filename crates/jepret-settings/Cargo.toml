@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 jepret-core.workspace = true
 jepret-workflow.workspace = true
+jepret-ui-theme.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 eframe.workspace = true

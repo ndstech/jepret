@@ -1155,6 +1155,7 @@ dependencies = [
  "eframe",
  "egui",
  "jepret-core",
+ "jepret-ui-theme",
  "jepret-workflow",
  "rfd",
  "toml",
