@@ -5,12 +5,13 @@ use std::{collections::HashMap, path::PathBuf};
 use egui::{Color32, RichText};
 use jepret_core::{
     config::{HotkeyBinding, ImageFormat},
-    Action, CaptureKind, CommandSpec, Config,
+    shortcuts::EDITOR_SHORTCUTS,
+    Action, CaptureKind, CommandSpec, Config, KeyCombo,
 };
 use jepret_workflow::OpenWithCandidate;
 
 use crate::{
-    hotkey::{self, Hotkey},
+    hotkey, keyhook,
     model::{self, Issue, Severity},
 };
 
@@ -18,15 +19,17 @@ use crate::{
 enum Tab {
     General,
     Hotkeys,
+    Shortcuts,
     Apps,
     History,
     Recording,
     Capture,
 }
 
-const TABS: [(Tab, &str); 6] = [
+const TABS: [(Tab, &str); 7] = [
     (Tab::General, "Umum"),
     (Tab::Hotkeys, "Hotkey & Workflow"),
+    (Tab::Shortcuts, "Shortcut"),
     (Tab::Apps, "Aplikasi eksternal"),
     (Tab::History, "History & Cleanup"),
     (Tab::Recording, "Recording"),
@@ -48,15 +51,26 @@ fn kind_label(k: CaptureKind) -> &'static str {
     CAPTURE_KINDS.iter().find(|(c, _)| *c == k).map(|(_, l)| *l).unwrap_or("?")
 }
 
+#[derive(Clone, PartialEq, Eq)]
+enum RecTarget {
+    /// Replace the combo of global hotkey `i`.
+    Global(usize),
+    /// Add a combo to editor shortcut `id`.
+    EditorAdd(String),
+}
+
 pub struct SettingsApp {
     path: PathBuf,
     cfg: Config,
     saved: Config,
     tab: Tab,
     status: Option<(bool, String)>,
-    /// Hotkey index currently capturing a key press.
-    recording: Option<usize>,
+    /// What the key recorder is currently capturing for.
+    recording: Option<RecTarget>,
     record_msg: Option<String>,
+    /// Low-level keyboard hook; exists only while recording.
+    hook: Option<keyhook::Recorder>,
+    search: String,
     /// Text buffers for args lines, keyed by a stable-ish id; cleared on structural edits.
     bufs: HashMap<String, String>,
     candidates: Option<(Vec<OpenWithCandidate>, Option<String>)>,
@@ -72,6 +86,8 @@ impl SettingsApp {
             status: None,
             recording: None,
             record_msg: None,
+            hook: None,
+            search: String::new(),
             bufs: HashMap::new(),
             candidates: None,
         }
@@ -95,27 +111,81 @@ impl SettingsApp {
         }
     }
 
-    fn poll_hotkey_recording(&mut self, ctx: &egui::Context) {
-        let Some(idx) = self.recording else { return };
+    fn start_recording(&mut self, t: RecTarget) {
+        self.hook = None;
+        self.hook = keyhook::Recorder::start();
+        self.recording = Some(t);
+        self.record_msg = None;
+    }
+
+    fn stop_recording(&mut self) {
+        self.hook = None; // drop = unhook
+        self.recording = None;
+        self.record_msg = None;
+    }
+
+    fn apply_combo(&mut self, combo: KeyCombo) {
+        let Some(t) = self.recording.clone() else { return };
+        match t {
+            RecTarget::Global(i) => {
+                if let Err(e) = hotkey::check_global(&combo) {
+                    self.record_msg = Some(e);
+                    return;
+                }
+                if let Some(b) = self.cfg.hotkeys.get_mut(i) {
+                    b.keys = combo.to_string();
+                }
+            }
+            RecTarget::EditorAdd(id) => {
+                let mut list = model::editor_effective(&self.cfg, &id);
+                list.push(combo.to_string());
+                model::set_editor_combos(&mut self.cfg, &id, &list);
+            }
+        }
+        self.stop_recording();
+    }
+
+    fn poll_recording(&mut self, ctx: &egui::Context) {
+        if self.recording.is_none() {
+            return;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(60));
+        if let Some(h) = &self.hook {
+            match h.poll() {
+                Some(keyhook::Outcome::Combo(c)) => self.apply_combo(c),
+                Some(keyhook::Outcome::Cancelled) => self.stop_recording(),
+                Some(keyhook::Outcome::Unsupported(m)) => self.record_msg = Some(m),
+                None => {}
+            }
+            return;
+        }
+        // Fallback when the hook could not be installed: egui events (no PrtSc / Win).
         let events = ctx.input(|i| i.events.clone());
         for ev in events {
             let egui::Event::Key { key, pressed: true, modifiers, repeat: false, .. } = ev else { continue };
             if key == egui::Key::Escape && !modifiers.any() {
-                self.recording = None;
-                self.record_msg = None;
+                self.stop_recording();
                 return;
             }
-            let name = format!("{key:?}");
-            match Hotkey::from_parts(modifiers.ctrl, modifiers.alt, modifiers.shift, false, &name) {
-                Ok(h) => {
-                    if let Some(b) = self.cfg.hotkeys.get_mut(idx) {
-                        b.keys = h.to_string();
-                    }
-                    self.recording = None;
-                    self.record_msg = None;
+            let name = match format!("{key:?}").as_str() {
+                n if n.starts_with("Num") && n.len() == 4 => n[3..].to_string(),
+                "Backtick" => "backquote".into(),
+                "OpenBracket" => "bracketleft".into(),
+                "CloseBracket" => "bracketright".into(),
+                "Equals" => "plus".into(),
+                n => n.to_string(),
+            };
+            let mut c = match KeyCombo::parse(&name) {
+                Ok(c) => c,
+                Err(e) => {
+                    self.record_msg = Some(e.to_string());
+                    return;
                 }
-                Err(e) => self.record_msg = Some(e),
-            }
+            };
+            c.ctrl = modifiers.ctrl;
+            c.alt = modifiers.alt;
+            c.shift = modifiers.shift;
+            self.apply_combo(c);
             return;
         }
     }
@@ -123,7 +193,8 @@ impl SettingsApp {
 
 impl eframe::App for SettingsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_hotkey_recording(ctx);
+        self.poll_recording(ctx);
+        let tab_before = self.tab;
         let mut preview = self.cfg.clone();
         model::normalize_config(&mut preview);
         let issues = model::validate(&preview);
@@ -155,7 +226,7 @@ impl eframe::App for SettingsApp {
                 if ui.add_enabled(dirty, egui::Button::new("Batalkan perubahan")).clicked() {
                     self.cfg = self.saved.clone();
                     self.bufs.clear();
-                    self.recording = None;
+                    self.stop_recording();
                 }
                 if dirty {
                     ui.colored_label(Color32::from_rgb(220, 160, 0), "belum disimpan");
@@ -168,10 +239,14 @@ impl eframe::App for SettingsApp {
             ui.add_space(4.0);
         });
 
+        if self.tab != tab_before {
+            self.stop_recording();
+        }
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.tab {
                 Tab::General => general_tab(ui, &mut self.cfg),
                 Tab::Hotkeys => self.hotkeys_tab(ui),
+                Tab::Shortcuts => self.shortcuts_tab(ui),
                 Tab::Apps => self.apps_tab(ui),
                 Tab::History => history_tab(ui, &mut self.cfg),
                 Tab::Recording => self.recording_tab(ui),
@@ -263,6 +338,40 @@ fn general_tab(ui: &mut egui::Ui, cfg: &mut Config) {
     section(ui, "Perilaku");
     ui.checkbox(&mut g.play_sound, "Bunyi saat capture");
     ui.checkbox(&mut g.start_with_windows, "Jalankan saat Windows start");
+    editor_section(ui, cfg);
+}
+
+fn editor_section(ui: &mut egui::Ui, cfg: &mut Config) {
+    section(ui, "Editor");
+    let e = &mut cfg.editor;
+    ui.checkbox(&mut e.show_shortcut_hints, "Tampilkan hint shortcut di tooltip dan menu");
+    ui.horizontal(|ui| {
+        ui.label("Tool awal:");
+        let cur = EDITOR_SHORTCUTS
+            .iter()
+            .find(|s| s.id == e.default_tool)
+            .map(|s| s.label)
+            .unwrap_or(e.default_tool.as_str())
+            .to_string();
+        egui::ComboBox::from_id_salt("default_tool").selected_text(cur).show_ui(ui, |ui| {
+            for d in EDITOR_SHORTCUTS.iter().filter(|d| d.id.starts_with("tool.")) {
+                ui.selectable_value(&mut e.default_tool, d.id.to_string(), d.label);
+            }
+        });
+    });
+    ui.label("Palet warna (tombol 1-9):");
+    ui.horizontal_wrapped(|ui| {
+        for (i, hex) in e.palette.iter_mut().enumerate() {
+            let rgba = model::parse_hex_color(hex).unwrap_or([128, 128, 128, 255]);
+            let mut c = Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3]);
+            ui.vertical(|ui| {
+                ui.label(format!("{}", i + 1));
+                if ui.color_edit_button_srgba(&mut c).changed() {
+                    *hex = model::format_hex_color(c.to_srgba_unmultiplied());
+                }
+            });
+        }
+    });
 }
 
 fn history_tab(ui: &mut egui::Ui, cfg: &mut Config) {
@@ -351,11 +460,13 @@ impl SettingsApp {
             hotkey::find_duplicates(&ks).into_iter().flat_map(|(a, b)| [a, b]).collect()
         };
         let mut remove = None;
+        let mut start: Option<usize> = None;
+        let mut stop = false;
         let mut swap: Option<(usize, usize)> = None;
         let n = self.cfg.hotkeys.len();
         for i in 0..n {
             let mut structural = false;
-            let recording_this = self.recording == Some(i);
+            let recording_this = self.recording == Some(RecTarget::Global(i));
             let b = &mut self.cfg.hotkeys[i];
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -368,12 +479,11 @@ impl SettingsApp {
                     ui.add_enabled(!recording_this, te);
                     if recording_this {
                         if ui.button("Batal rekam").clicked() {
-                            self.recording = None;
+                            stop = true;
                         }
                         ui.colored_label(Color32::from_rgb(220, 160, 0), "tekan kombinasi tombol... (Esc batal)");
                     } else if ui.button("Rekam").clicked() {
-                        self.recording = Some(i);
-                        self.record_msg = None;
+                        start = Some(i);
                     }
                     egui::ComboBox::from_id_salt(("kind", i)).selected_text(kind_label(b.capture)).show_ui(ui, |ui| {
                         for (k, l) in CAPTURE_KINDS {
@@ -394,7 +504,6 @@ impl SettingsApp {
                     if let Some(m) = &self.record_msg {
                         ui.colored_label(Color32::from_rgb(220, 70, 60), m);
                     }
-                    ui.weak("Tombol Win tidak bisa direkam; ketik manual, mis. win+shift+s.");
                 }
                 ui.label("Actions (berurutan):");
                 structural |= actions_editor(ui, &format!("hk{i}"), &mut b.actions, &keys, &mut self.bufs, false);
@@ -403,15 +512,21 @@ impl SettingsApp {
                 self.bufs.retain(|k, _| !k.starts_with(&format!("hk{i}:")));
             }
         }
+        if stop {
+            self.stop_recording();
+        }
+        if let Some(i) = start {
+            self.start_recording(RecTarget::Global(i));
+        }
         if let Some((a, b)) = swap {
             self.cfg.hotkeys.swap(a, b);
             self.bufs.clear();
-            self.recording = None;
+            self.stop_recording();
         }
         if let Some(i) = remove {
             self.cfg.hotkeys.remove(i);
             self.bufs.clear();
-            self.recording = None;
+            self.stop_recording();
         }
         if ui.button("+ Tambah hotkey").clicked() {
             self.cfg.hotkeys.push(HotkeyBinding {
@@ -421,7 +536,157 @@ impl SettingsApp {
             });
         }
         ui.add_space(4.0);
-        ui.weak("Format: ctrl+shift+4, printscreen, alt+printscreen, ctrl+alt+f5 (huruf kecil, modifier dulu).");
+        ui.weak("Format kanonik: ctrl+shift+printscreen, alt+f5, ctrl+plus ... (lihat juga tab Shortcut).");
+    }
+
+    fn shortcuts_tab(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(
+                "Windows 11 memakai PrtSc untuk Snipping Tool - matikan di Settings > Accessibility > Keyboard \
+                 (\"Use the Print screen button to open screen capture\") agar hotkey Jepret berfungsi.",
+            );
+            if ui.button("Buka pengaturan Keyboard Windows").clicked() {
+                if let Err(e) = std::process::Command::new("explorer.exe").arg("ms-settings:easeofaccess-keyboard").spawn()
+                {
+                    self.status = Some((false, format!("Gagal membuka pengaturan: {e}")));
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Cari:");
+            ui.text_edit_singleline(&mut self.search);
+            if ui.button("x").clicked() {
+                self.search.clear();
+            }
+        });
+        let q = self.search.trim().to_lowercase();
+        let matches = |texts: &[&str]| q.is_empty() || texts.iter().any(|t| t.to_lowercase().contains(&q));
+
+        let mut start: Option<RecTarget> = None;
+        let mut stop = false;
+        let rec = self.recording.clone();
+        let rec_msg = self.record_msg.clone();
+
+        section(ui, "Hotkey global");
+        let dups: Vec<usize> = {
+            let ks: Vec<&str> = self.cfg.hotkeys.iter().map(|h| h.keys.as_str()).collect();
+            hotkey::find_duplicates(&ks).into_iter().flat_map(|(a, b)| [a, b]).collect()
+        };
+        egui::Grid::new("global_sc").num_columns(3).striped(true).show(ui, |ui| {
+            for (i, b) in self.cfg.hotkeys.iter().enumerate() {
+                let pretty = hotkey::parse(&b.keys).map(|c| c.pretty()).unwrap_or_else(|_| b.keys.clone());
+                if !matches(&[kind_label(b.capture), &pretty]) {
+                    continue;
+                }
+                ui.label(kind_label(b.capture));
+                let bad = hotkey::normalize(&b.keys).is_err() || dups.contains(&i);
+                let txt = RichText::new(&pretty).monospace();
+                ui.label(if bad { txt.color(Color32::from_rgb(220, 70, 60)) } else { txt });
+                if rec == Some(RecTarget::Global(i)) {
+                    if ui.button("Batal").clicked() {
+                        stop = true;
+                    }
+                    ui.colored_label(Color32::from_rgb(220, 160, 0), "tekan kombinasi... (Esc batal)");
+                } else if ui.button("Rekam").clicked() {
+                    start = Some(RecTarget::Global(i));
+                }
+                ui.end_row();
+            }
+        });
+        for (a, b) in hotkey::find_duplicates(&self.cfg.hotkeys.iter().map(|h| h.keys.as_str()).collect::<Vec<_>>()) {
+            ui.colored_label(Color32::from_rgb(220, 70, 60), format!("Bentrok: hotkey #{} dan #{} sama", a + 1, b + 1));
+        }
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Shortcut editor").strong());
+            if ui.button("Reset semua").clicked() {
+                model::reset_all_editor(&mut self.cfg);
+            }
+        });
+        if matches!(rec, Some(RecTarget::EditorAdd(_))) {
+            ui.colored_label(Color32::from_rgb(220, 160, 0), "Merekam... tekan kombinasi (Esc batal)");
+        }
+        if let Some(m) = &rec_msg {
+            ui.colored_label(Color32::from_rgb(220, 70, 60), m);
+        }
+        let conflict_set: std::collections::HashSet<String> =
+            model::editor_conflicts(&self.cfg).into_iter().map(|(c, _)| c.to_string()).collect();
+        let mut groups: Vec<&str> = Vec::new();
+        for d in EDITOR_SHORTCUTS {
+            if !groups.contains(&d.group) {
+                groups.push(d.group);
+            }
+        }
+        let mut edits: Vec<(&'static str, Vec<String>)> = Vec::new();
+        let mut resets: Vec<&'static str> = Vec::new();
+        for g in groups {
+            let defs: Vec<_> = EDITOR_SHORTCUTS
+                .iter()
+                .filter(|d| d.group == g)
+                .filter(|d| {
+                    let eff = model::editor_effective(&self.cfg, d.id).join(" ");
+                    matches(&[d.label, d.id, g, &eff])
+                })
+                .collect();
+            if defs.is_empty() {
+                continue;
+            }
+            egui::CollapsingHeader::new(g).default_open(true).open(if q.is_empty() { None } else { Some(true) }).show(
+                ui,
+                |ui| {
+                    for d in defs {
+                        let combos = model::editor_effective(&self.cfg, d.id);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.add_sized([180.0, 18.0], egui::Label::new(d.label));
+                            for (ci, c) in combos.iter().enumerate() {
+                                let pretty = KeyCombo::parse(c).map(|k| k.pretty()).unwrap_or_else(|_| c.clone());
+                                let mut t = RichText::new(format!("{pretty}  x")).monospace();
+                                if conflict_set.contains(c) {
+                                    t = t.color(Color32::from_rgb(220, 70, 60));
+                                }
+                                if ui.small_button(t).on_hover_text("Klik untuk hapus").clicked() {
+                                    let mut n = combos.clone();
+                                    n.remove(ci);
+                                    edits.push((d.id, n));
+                                }
+                            }
+                            if combos.is_empty() {
+                                ui.weak("(nonaktif)");
+                            }
+                            let this = RecTarget::EditorAdd(d.id.to_string());
+                            if rec.as_ref() == Some(&this) {
+                                if ui.small_button("Batal").clicked() {
+                                    stop = true;
+                                }
+                            } else if ui.small_button("+ Rekam").clicked() {
+                                start = Some(this);
+                            }
+                            if model::editor_is_overridden(&self.cfg, d.id) && ui.small_button("Reset").clicked() {
+                                resets.push(d.id);
+                            }
+                        });
+                    }
+                },
+            );
+        }
+        for (id, list) in edits {
+            model::set_editor_combos(&mut self.cfg, id, &list);
+        }
+        for id in resets {
+            self.cfg.editor.shortcuts.remove(id);
+        }
+        if stop {
+            self.stop_recording();
+        }
+        if let Some(t) = start {
+            self.start_recording(t);
+        }
+        ui.add_space(6.0);
+        ui.weak(
+            "Gestur tetap: Shift = batasi sudut/proporsi, Alt = dari tengah, Space+drag = geser kanvas, \
+             Ctrl+scroll = zoom. Override hanya disimpan bila berbeda dari default.",
+        );
     }
 
     fn apps_tab(&mut self, ui: &mut egui::Ui) {

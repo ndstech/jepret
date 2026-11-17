@@ -14,6 +14,7 @@ eframe.workspace = true
 egui.workspace = true
 # Native Win32 file dialogs; no extra runtime on Windows.
 rfd = { version = "0.15", default-features = false }
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 toml.workspace = true

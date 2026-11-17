@@ -2,7 +2,11 @@
 
 use std::{collections::BTreeMap, path::Path, path::PathBuf};
 
-use jepret_core::{config::ExternalApp, Action, Config};
+use jepret_core::{
+    config::ExternalApp,
+    shortcuts::{self, EDITOR_SHORTCUTS},
+    Action, Config, KeyCombo,
+};
 
 use crate::hotkey;
 
@@ -105,6 +109,24 @@ pub fn validate(cfg: &Config) -> Vec<Issue> {
     if cfg.scroll.wheel_notches == 0 {
         out.push(Issue::err("Scroll: wheel notches harus > 0"));
     }
+    for (i, c) in cfg.editor.palette.iter().enumerate() {
+        if !is_hex_color(c) {
+            out.push(Issue::err(format!("Palet editor #{}: \"{c}\" bukan #rrggbb / #rrggbbaa", i + 1)));
+        }
+    }
+    if cfg.editor.palette.len() != 9 {
+        out.push(Issue::warn("Palet editor sebaiknya berisi tepat 9 warna"));
+    }
+    if !EDITOR_SHORTCUTS.iter().any(|s| s.id == cfg.editor.default_tool && s.id.starts_with("tool.")) {
+        out.push(Issue::err(format!("Tool awal editor tidak dikenal: {}", cfg.editor.default_tool)));
+    }
+    let (_, warns) = shortcuts::resolve_editor_keymap(&cfg.editor.shortcuts);
+    for w in warns {
+        out.push(Issue::warn(format!("Shortcut editor: {w}")));
+    }
+    for (combo, ids) in editor_conflicts(cfg) {
+        out.push(Issue::warn(format!("Shortcut editor bentrok: {} dipakai oleh {}", combo.pretty(), ids.join(", "))));
+    }
     if let Some(n) = cfg.capture.sdr_white_nits {
         if !n.is_finite() || n <= 0.0 {
             out.push(Issue::err("SDR white level harus > 0 nits"));
@@ -113,12 +135,94 @@ pub fn validate(cfg: &Config) -> Vec<Issue> {
     out
 }
 
+// ---- editor shortcuts (overrides stored only when different from default) ----
+
+/// Canonical default combos of an editor shortcut id.
+pub fn editor_defaults(id: &str) -> Vec<String> {
+    EDITOR_SHORTCUTS
+        .iter()
+        .find(|s| s.id == id)
+        .map(|s| s.defaults.iter().filter_map(|d| KeyCombo::parse(d).ok()).map(|c| c.to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// Effective canonical combos: override if present, else defaults.
+pub fn editor_effective(cfg: &Config, id: &str) -> Vec<String> {
+    match cfg.editor.shortcuts.get(id) {
+        Some(list) => list.iter().filter_map(|s| KeyCombo::parse(s).ok()).map(|c| c.to_string()).collect(),
+        None => editor_defaults(id),
+    }
+}
+
+pub fn editor_is_overridden(cfg: &Config, id: &str) -> bool {
+    cfg.editor.shortcuts.contains_key(id)
+}
+
+/// Set the combos for `id`; stores an override only when it differs from the defaults.
+/// Duplicates are dropped, order preserved.
+pub fn set_editor_combos(cfg: &mut Config, id: &str, combos: &[String]) {
+    let mut canon: Vec<String> = Vec::new();
+    for c in combos {
+        if let Ok(k) = KeyCombo::parse(c) {
+            let s = k.to_string();
+            if !canon.contains(&s) {
+                canon.push(s);
+            }
+        }
+    }
+    if canon == editor_defaults(id) {
+        cfg.editor.shortcuts.remove(id);
+    } else {
+        cfg.editor.shortcuts.insert(id.to_string(), canon);
+    }
+}
+
+pub fn reset_all_editor(cfg: &mut Config) {
+    cfg.editor.shortcuts.clear();
+}
+
+/// Editor combos bound to more than one command.
+pub fn editor_conflicts(cfg: &Config) -> Vec<(KeyCombo, Vec<&'static str>)> {
+    let (map, _) = shortcuts::resolve_editor_keymap(&cfg.editor.shortcuts);
+    shortcuts::conflicts(&map)
+}
+
+/// `#rrggbb` or `#rrggbbaa`.
+pub fn is_hex_color(s: &str) -> bool {
+    s.strip_prefix('#').is_some_and(|h| (h.len() == 6 || h.len() == 8) && h.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// Parse `#rrggbb[aa]` to RGBA bytes.
+pub fn parse_hex_color(s: &str) -> Option<[u8; 4]> {
+    if !is_hex_color(s) {
+        return None;
+    }
+    let h = &s[1..];
+    let b = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
+    Some([b(0)?, b(2)?, b(4)?, if h.len() == 8 { b(6)? } else { 255 }])
+}
+
+pub fn format_hex_color(c: [u8; 4]) -> String {
+    if c[3] == 255 {
+        format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
+    } else {
+        format!("#{:02x}{:02x}{:02x}{:02x}", c[0], c[1], c[2], c[3])
+    }
+}
+
 /// Rewrite hotkey strings into canonical form. Invalid ones are left untouched
 /// (validation reports them). Call before saving.
 pub fn normalize_config(cfg: &mut Config) {
     for hk in &mut cfg.hotkeys {
         if let Ok(n) = hotkey::normalize(&hk.keys) {
             hk.keys = n;
+        }
+    }
+    for list in cfg.editor.shortcuts.values_mut() {
+        for c in list.iter_mut() {
+            if let Ok(k) = KeyCombo::parse(c) {
+                *c = k.to_string();
+            }
         }
     }
     if let Some(m) = &cfg.recording.mic_device {
@@ -306,6 +410,57 @@ mod tests {
         c.save(&path).unwrap();
         assert_eq!(Config::load(&path).unwrap(), c);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn editor_override_stored_only_when_different() {
+        let mut c = Config::default();
+        assert_eq!(editor_effective(&c, "tool.arrow"), vec!["a"]);
+        set_editor_combos(&mut c, "tool.arrow", &["Ctrl+Shift+A".into(), "ctrl+shift+a".into()]);
+        assert_eq!(c.editor.shortcuts["tool.arrow"], vec!["ctrl+shift+a"]);
+        assert!(editor_is_overridden(&c, "tool.arrow"));
+        // back to default (lenient spelling) -> override removed
+        set_editor_combos(&mut c, "tool.arrow", &["A".into()]);
+        assert!(c.editor.shortcuts.is_empty());
+        // multi-combo default compares as ordered list
+        set_editor_combos(&mut c, "edit.redo", &["ctrl+y".into(), "ctrl+shift+z".into()]);
+        assert!(c.editor.shortcuts.is_empty());
+        // disabling = empty override
+        set_editor_combos(&mut c, "tool.pixelate", &[]);
+        assert_eq!(c.editor.shortcuts["tool.pixelate"], Vec::<String>::new());
+        assert!(editor_effective(&c, "tool.pixelate").is_empty());
+        reset_all_editor(&mut c);
+        assert!(c.editor.shortcuts.is_empty());
+    }
+
+    #[test]
+    fn editor_conflict_is_warning() {
+        let mut c = Config::default();
+        set_editor_combos(&mut c, "tool.arrow", &["r".into()]); // clashes with tool.rect
+        assert_eq!(editor_conflicts(&c).len(), 1);
+        let issues = validate(&c);
+        assert!(!has_errors(&issues));
+        assert!(issues.iter().any(|i| i.message.contains("bentrok")));
+    }
+
+    #[test]
+    fn editor_config_validation_and_colors() {
+        let mut c = Config::default();
+        c.editor.palette[0] = "red".into();
+        c.editor.default_tool = "edit.undo".into();
+        assert_eq!(validate(&c).iter().filter(|i| i.severity == Severity::Error).count(), 2);
+        assert_eq!(parse_hex_color("#e53935"), Some([0xe5, 0x39, 0x35, 255]));
+        assert_eq!(parse_hex_color("#11223344"), Some([0x11, 0x22, 0x33, 0x44]));
+        assert_eq!(parse_hex_color("#12"), None);
+        assert_eq!(format_hex_color([1, 2, 3, 255]), "#010203");
+        assert_eq!(parse_hex_color(&format_hex_color([9, 8, 7, 6])), Some([9, 8, 7, 6]));
+    }
+
+    #[test]
+    fn default_hotkeys_have_no_duplicates() {
+        let c = Config::default();
+        let ks: Vec<&str> = c.hotkeys.iter().map(|h| h.keys.as_str()).collect();
+        assert!(hotkey::find_duplicates(&ks).is_empty());
     }
 
     #[test]

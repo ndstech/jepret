@@ -4,8 +4,8 @@
 //! `jepret_core::Config` and writes it with `Config::save`. The daemon
 //! picks up changes (T12 decides: file watcher or reload message).
 //!
-//! Saved hotkey strings are normalized to the canonical form documented in
-//! [`hotkey`] (e.g. `ctrl+shift+4`); T12 can rely on that grammar.
+//! Saved hotkey strings are normalized to `jepret_core::KeyCombo`'s canonical
+//! form (e.g. `ctrl+shift+printscreen`); T12 should parse with `KeyCombo`.
 //!
 //! The "Open with" picker uses `jepret_workflow::open_with_candidates`; if it
 //! fails the list is simply empty and the user can pick an `.exe` manually.
@@ -15,6 +15,7 @@ use std::path::Path;
 use jepret_core::{Config, Result};
 
 pub mod hotkey;
+mod keyhook;
 pub mod model;
 mod ui;
 
