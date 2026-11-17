@@ -63,6 +63,18 @@ pub struct General {
     pub monthly_subfolders: bool,
     pub play_sound: bool,
     pub start_with_windows: bool,
+    /// UI theme for editor / gallery / settings.
+    pub theme: ThemeMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeMode {
+    /// Follow Windows "app mode" (light/dark).
+    #[default]
+    System,
+    Light,
+    Dark,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,6 +214,7 @@ impl Default for General {
             monthly_subfolders: true,
             play_sound: false,
             start_with_windows: false,
+            theme: ThemeMode::System,
         }
     }
 }

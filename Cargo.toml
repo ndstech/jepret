@@ -21,6 +21,7 @@ jepret-scroll = { path = "crates/jepret-scroll" }
 jepret-editor = { path = "crates/jepret-editor" }
 jepret-gallery = { path = "crates/jepret-gallery" }
 jepret-settings = { path = "crates/jepret-settings" }
+jepret-ui-theme = { path = "crates/jepret-ui-theme" }
 
 # shared external — pakai `xxx.workspace = true` di crate supaya versi seragam.
 # Kalau versi di sini tidak resolve, naikkan di sini (bukan di crate).

@@ -1162,6 +1162,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "jepret-ui-theme"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "jepret-core",
+ "tracing",
+ "windows 0.58.0",
+]
+
+[[package]]
 name = "jepret-workflow"
 version = "0.1.0"
 dependencies = [

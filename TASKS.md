@@ -174,8 +174,24 @@ capture hdr  overlay workflow history editor stitch recorder gallery settings
 
 **Output:** token desain (warna light/dark, radius, spacing, tipografi), mockup tiap layar, set ikon tool (13) + ikon tray/app.
 
-### T15 — Terapkan desain
-Implementasi token & mockup T14 ke `jepret-editor`, `jepret-gallery`, `jepret-settings` (tema egui bersama — kemungkinan crate baru `jepret-ui-theme`), overlay & border di `jepret-overlay`, ikon di `jepret-app`. Paralel per crate seperti Wave 1.
+### T15 — Terapkan desain (Wave 3, paralel)
+Sumber kebenaran visual: kanvas https://claude.ai/artifact/QJGaMEX5iCXhnkXdVajf1c (7 artboard). Kode kanvas tidak perlu dibuka; semua token sudah ada di crate **`jepret-ui-theme`**:
+`tokens::Palette` (LIGHT/DARK), konstanta radius/spacing/ukuran, `install(ctx, config.general.theme)` (font Segoe UI Variable + Cascadia Mono dari sistem, visuals egui), `icons::{Icon, paint, paint_filled}`, `widgets::{kbd, shortcut_hint, primary_button, button, IconButton, toggle, segmented, section_header, banner}`.
+
+Aturan bersama:
+- **Jangan hard-code warna** di crate UI — ambil dari `Palette`. Jangan ubah `jepret-ui-theme` kecuali kamu T15a; butuh widget baru → buat lokal di crate-mu dan laporkan.
+- Title bar tetap native Windows (tidak membuat title bar custom).
+- Ikon masih placeholder (kotak) sampai T15a merge — itu normal.
+- Mode tema ikut `config.general.theme` (System/Light/Dark).
+
+| ID | Ticket | File milik ticket |
+|---|---|---|
+| T15a | Renderer ikon SVG-path + polish widget | `crates/jepret-ui-theme/src/icons.rs`, `widgets.rs` |
+| T15b | Editor sesuai artboard "Editor — terang/gelap + cheat-sheet" | `crates/jepret-editor/**` |
+| T15c | Galeri sesuai artboard "Galeri riwayat" | `crates/jepret-gallery/**` |
+| T15d | Settings sesuai artboard "Settings — tab Shortcut" + pilihan tema | `crates/jepret-settings/**` |
+| T15e | Overlay & indikator rekam (Direct2D) sesuai "Overlay region" + "Tray…" | `crates/jepret-overlay/**` |
+| T15f | Ikon aplikasi (.ico di exe) + ikon tray idle/rekam + ikon menu tray | `crates/jepret-app/**` |
 
 ---
 
@@ -204,4 +220,5 @@ _(catat di sini setiap perubahan/penambahan API publik lintas crate)_
 - **capture (T01):** `ensure_dpi_aware()`, `release_cache()` (daemon memanggilnya setelah 60 s idle), helper murni `bgra_to_rgba`/`blit`/`compose`.
 - **history (T05):** `HistoryDb::with_thumbs_dir`, `thumbs_dir`, `refresh_missing`. `HistoryDb` Send, bukan Sync.
 - **gallery/settings/overlay/recorder:** hanya modul publik tambahan, signature lama tetap.
+- **core (T15):** `config::ThemeMode` + `General.theme` (System/Light/Dark). Crate baru `jepret-ui-theme`.
 - **workspace:** `rust-version` 1.88 (dipakai `as_chunks`), release `panic = "unwind"` supaya daemon bisa menangkap panic worker.
