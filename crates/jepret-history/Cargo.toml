@@ -9,4 +9,9 @@ license.workspace = true
 jepret-core.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-# T05: rusqlite, image, trash
+rusqlite.workspace = true
+image.workspace = true
+trash.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
