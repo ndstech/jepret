@@ -9,8 +9,10 @@ pub mod capture;
 pub mod config;
 pub mod geom;
 pub mod image;
+pub mod keys;
 pub mod monitor;
 pub mod paths;
+pub mod shortcuts;
 pub mod state;
 pub mod template;
 
@@ -19,6 +21,7 @@ pub use capture::{CaptureKind, CaptureResult};
 pub use config::Config;
 pub use geom::{Point, Rect};
 pub use image::Image;
+pub use keys::KeyCombo;
 pub use monitor::{MonitorId, MonitorInfo};
 pub use state::AppState;
 

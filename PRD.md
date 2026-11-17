@@ -138,6 +138,38 @@ Setiap hotkey punya `capture` + daftar `actions` yang dijalankan berurutan. Kega
 - Process DPI awareness: **Per-Monitor V2**.
 - CLI: `jepret capture <kind>`, `jepret --editor <file>`, `jepret --gallery`, `jepret --settings`.
 
+### F13 — Shortcut: ramah & bisa diubah
+Prinsip: **semua bisa dikerjakan dari keyboard**, default mudah diingat, semua bisa diganti di Settings atau `config.toml`, bentrok dideteksi.
+
+**Hotkey global (default, semua di tombol PrtSc):**
+
+| Tombol | Aksi |
+|---|---|
+| `PrtSc` | Region → save + clipboard + editor |
+| `Ctrl+PrtSc` | Fullscreen (semua monitor) |
+| `Alt+PrtSc` | Window aktif |
+| `Shift+PrtSc` | Last region |
+| `Ctrl+Shift+PrtSc` | Scroll capture |
+| `Ctrl+Alt+PrtSc` | Rekam region (tekan lagi = stop) |
+| `Alt+Shift+PrtSc` | Rekam monitor aktif (tekan lagi = stop) |
+
+- Format string: `jepret_core::keys::KeyCombo` (lenient: `PrtSc`, `ctrl+=`, `Esc`; disimpan kanonik `ctrl+shift+printscreen`).
+- **Windows 11 memakai PrtSc untuk Snipping Tool.** Saat start, daemon membaca `HKCU\Control Panel\Keyboard\PrintScreenKeyForSnippingEnabled`; kalau aktif, tampilkan notifikasi + tombol yang membuka `ms-settings:easeofaccess-keyboard` agar user mematikannya sendiri (app tidak mengubah setting sistem).
+- Hotkey yang gagal didaftarkan (dipakai app lain) → notifikasi menyebut kombinasinya + saran ganti.
+
+**Overlay region (tetap, ditampilkan di hint bar bawah):** `Enter`/`Space`/double-click = konfirmasi · `Esc`/klik kanan = batal · panah = geser 1 px, `Shift`+panah = 10 px · `Ctrl`+panah = resize 1 px, `Ctrl+Shift`+panah = 10 px · `Tab`/`Shift+Tab` = pindah snap window · `F` = seluruh monitor di bawah kursor · `A` = semua monitor · `M` = magnifier on/off · `C` = copy koordinat warna piksel (hex).
+
+**Editor (semua bisa diubah, katalog di `jepret_core::shortcuts::EDITOR_SHORTCUTS`):**
+- Tool satu huruf: `V` pilih, `C` crop, `A` panah, `L` garis, `R` kotak, `E` elips, `T` teks, `H` highlighter, `B` blur, `X` pixelate, `N` nomor urut, `P` pen, `I` ambil warna.
+- Gaya: `1`–`9` warna palet, `[` / `]` tebal, `F` isi/outline, `S` bayangan.
+- Edit: `Ctrl+Z`, `Ctrl+Y`/`Ctrl+Shift+Z`, `Del`, `Ctrl+D` duplikat, `Ctrl+A`, `Ctrl+[` / `Ctrl+]` urutan layer, panah geser (Shift = 10 px), `Ctrl+Shift+N` reset nomor.
+- Tampilan: `Ctrl+=`/`Ctrl+-`, `Ctrl+0` pas layar, `Ctrl+1` 100%, `F1` atau `?` cheat-sheet.
+- File: `Ctrl+C` copy, `Enter` copy & tutup, `Ctrl+S`, `Ctrl+Shift+S`, `Ctrl+Shift+Enter` simpan & tutup, `Ctrl+Shift+C` copy path, `Ctrl+O` buka di app lain, `Ctrl+Shift+O` buka folder, `Esc` tutup.
+- Gestur tetap: `Shift` saat menggambar = lurus 45° / kotak / lingkaran, `Alt` = dari tengah, `Space`+drag = pan, `Ctrl`+scroll = zoom, `Esc` membatalkan seleksi dulu sebelum menutup. Saat mengetik teks, hanya `Esc` dan `Ctrl+Enter` yang aktif.
+- Tooltip & menu menampilkan shortcut-nya (`editor.show_shortcut_hints`).
+
+**Settings:** tab "Shortcut" berisi tabel hotkey global + semua shortcut editor, kolom pencarian, tombol rekam kombinasi (tekan tombolnya langsung), reset per baris / reset semua, dan peringatan bentrok (`shortcuts::conflicts`).
+
 ### F12 — Settings
 - UI egui untuk semua field di `config.toml`: umum, hotkey + workflow, aplikasi eksternal, history/cleanup, recording, capture.
 - Simpan ke `config.toml`; daemon reload otomatis (file watcher atau perintah reload via single-instance channel).
@@ -230,8 +262,8 @@ Aturan: tambah dependency hanya kalau jelas menghemat waktu; cek dampak ke ukura
 
 | Versi | Isi | Catatan |
 |---|---|---|
-| v0.1 | F1, F2, F3, F4, F7, F11 | bisa dipakai harian |
-| v0.2 | F8, F9, F10, F12 | |
+| v0.1 | F1, F2, F3, F4, F7, F11, F13 (global + overlay) | bisa dipakai harian |
+| v0.2 | F8, F9, F10, F12, F13 (editor + settings) | |
 | v0.3 | F6 | |
 | v0.4 | F5 | |
 | lumbung | OCR, Telegram, WA/Email, pin, GIF | |

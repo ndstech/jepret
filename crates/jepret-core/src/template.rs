@@ -13,12 +13,12 @@ pub fn expand(template: &str, vars: &Vars<'_>) -> String {
     while let Some(i) = rest.find(['{', '}']) {
         out.push_str(&rest[..i]);
         let tail = &rest[i..];
-        if tail.starts_with("{{") {
+        if let Some(r) = tail.strip_prefix("{{") {
             out.push('{');
-            rest = &tail[2..];
-        } else if tail.starts_with("}}") {
+            rest = r;
+        } else if let Some(r) = tail.strip_prefix("}}") {
             out.push('}');
-            rest = &tail[2..];
+            rest = r;
         } else if tail.starts_with('{') {
             match tail.find('}') {
                 Some(end) => {
@@ -34,9 +34,9 @@ pub fn expand(template: &str, vars: &Vars<'_>) -> String {
                     rest = "";
                 }
             }
-        } else {
+        } else if let Some(r) = tail.strip_prefix('}') {
             out.push('}');
-            rest = &tail[1..];
+            rest = r;
         }
     }
     out.push_str(rest);
