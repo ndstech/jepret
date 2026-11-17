@@ -17,6 +17,38 @@ pub struct Config {
     pub history: HistoryConfig,
     pub recording: RecordingConfig,
     pub scroll: ScrollConfig,
+    pub editor: EditorConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EditorConfig {
+    /// Overrides of [`crate::shortcuts::EDITOR_SHORTCUTS`]: id → combos.
+    /// Present = replaces defaults; empty list = disabled. Absent = default.
+    pub shortcuts: BTreeMap<String, Vec<String>>,
+    /// Palette for `style.color_1`..`style.color_9`, `#rrggbb` or `#rrggbbaa`.
+    pub palette: Vec<String>,
+    /// Tool active when the editor opens (shortcut id, e.g. "tool.arrow").
+    pub default_tool: String,
+    /// Show shortcut hints in tooltips and next to menu items.
+    pub show_shortcut_hints: bool,
+}
+
+impl Default for EditorConfig {
+    fn default() -> Self {
+        Self {
+            shortcuts: BTreeMap::new(),
+            palette: [
+                "#e53935", "#fb8c00", "#fdd835", "#43a047", "#1e88e5", "#8e24aa", "#000000",
+                "#ffffff", "#757575",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+            default_tool: "tool.arrow".into(),
+            show_shortcut_hints: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -140,18 +172,22 @@ impl Default for Config {
         Self {
             general: General::default(),
             capture: CaptureConfig::default(),
+            // Everything lives on the PrtSc key so it is easy to remember:
+            // plain = the most used action, modifiers = variants.
             hotkeys: vec![
-                hk("printscreen", Fullscreen, vec![Save, Clipboard, Notify]),
+                hk("printscreen", Region, vec![Save, Clipboard, OpenEditor]),
+                hk("ctrl+printscreen", Fullscreen, vec![Save, Clipboard, Notify]),
                 hk("alt+printscreen", ActiveWindow, vec![Save, Clipboard, Notify]),
-                hk("ctrl+shift+4", Region, vec![Save, Clipboard, OpenEditor]),
-                hk("ctrl+shift+3", LastRegion, vec![Save, Clipboard, Notify]),
-                hk("ctrl+shift+6", Scroll, vec![Save, Clipboard, OpenEditor]),
-                hk("ctrl+shift+5", RecordRegion, vec![]),
+                hk("shift+printscreen", LastRegion, vec![Save, Clipboard, Notify]),
+                hk("ctrl+shift+printscreen", Scroll, vec![Save, Clipboard, OpenEditor]),
+                hk("ctrl+alt+printscreen", RecordRegion, vec![]),
+                hk("alt+shift+printscreen", RecordMonitor, vec![]),
             ],
             apps: BTreeMap::new(),
             history: HistoryConfig::default(),
             recording: RecordingConfig::default(),
             scroll: ScrollConfig::default(),
+            editor: EditorConfig::default(),
         }
     }
 }
@@ -299,6 +335,35 @@ mod tests {
         assert_eq!(c.apps["photocraft"].args, vec!["{file}".to_string()]);
         assert_eq!(c.history.cleanup.max_age_days, Some(7));
         assert!(c.history.cleanup.keep_favorites);
+    }
+
+    #[test]
+    fn default_hotkeys_parse_and_are_unique() {
+        let c = Config::default();
+        let mut combos: Vec<String> = c
+            .hotkeys
+            .iter()
+            .map(|h| crate::keys::KeyCombo::parse(&h.keys).unwrap().to_string())
+            .collect();
+        let n = combos.len();
+        combos.sort();
+        combos.dedup();
+        assert_eq!(combos.len(), n);
+    }
+
+    #[test]
+    fn editor_shortcut_overrides_parse() {
+        let c: Config = toml::from_str(
+            r#"
+            [editor.shortcuts]
+            "tool.arrow" = ["a", "ctrl+shift+a"]
+            "tool.pixelate" = []
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.editor.shortcuts["tool.arrow"].len(), 2);
+        assert!(c.editor.shortcuts["tool.pixelate"].is_empty());
+        assert_eq!(c.editor.palette.len(), 9);
     }
 
     #[test]
