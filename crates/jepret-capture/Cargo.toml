@@ -11,4 +11,4 @@ anyhow.workspace = true
 tracing.workspace = true
 # T01/T02: tambahkan saat implementasi, mis.
 # windows = { workspace = true, features = [...] }
-# half.workspace = true
+half.workspace = true
