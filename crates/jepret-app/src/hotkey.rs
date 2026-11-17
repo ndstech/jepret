@@ -14,32 +14,20 @@ pub struct Hotkey {
     pub vk: u32,
 }
 
-/// Parse a hotkey string (case-insensitive, parts separated by `+`).
+/// Parse a hotkey string via [`jepret_core::KeyCombo`] (lenient, case-insensitive).
 pub fn parse(s: &str) -> Result<Hotkey, String> {
-    let mut modifiers = 0u32;
-    let mut vk: Option<u32> = None;
-    for raw in s.split('+') {
-        let part = raw.trim().to_ascii_lowercase();
-        if part.is_empty() {
-            return Err(format!("empty part in hotkey {s:?}"));
-        }
-        let m = match part.as_str() {
-            "ctrl" | "control" | "ctl" => MOD_CONTROL,
-            "shift" => MOD_SHIFT,
-            "alt" => MOD_ALT,
-            "win" | "windows" | "meta" | "super" | "cmd" => MOD_WIN,
-            _ => 0,
-        };
-        if m != 0 {
+    let combo = jepret_core::KeyCombo::parse(s).map_err(|e| format!("{e:#}"))?;
+    from_combo(&combo)
+}
+
+pub fn from_combo(c: &jepret_core::KeyCombo) -> Result<Hotkey, String> {
+    let mut modifiers = 0;
+    for (on, m) in [(c.ctrl, MOD_CONTROL), (c.alt, MOD_ALT), (c.shift, MOD_SHIFT), (c.win, MOD_WIN)] {
+        if on {
             modifiers |= m;
-            continue;
-        }
-        let code = key_code(&part).ok_or_else(|| format!("unknown key {raw:?} in hotkey {s:?}"))?;
-        if vk.replace(code).is_some() {
-            return Err(format!("more than one non-modifier key in hotkey {s:?}"));
         }
     }
-    let vk = vk.ok_or_else(|| format!("no key in hotkey {s:?}"))?;
+    let vk = key_code(&c.key).ok_or_else(|| format!("no virtual-key mapping for {:?}", c.key))?;
     Ok(Hotkey { modifiers, vk })
 }
 
@@ -57,42 +45,46 @@ fn key_code(name: &str) -> Option<u32> {
             return Some(0x70 + n - 1);
         }
     }
-    if let Some(n) = name.strip_prefix("numpad").and_then(|n| n.parse::<u32>().ok()) {
+    if let Some(n) = name.strip_prefix("num").and_then(|n| n.parse::<u32>().ok()) {
         if n <= 9 {
             return Some(0x60 + n);
         }
     }
     Some(match name {
-        "printscreen" | "prtsc" | "prtscn" | "print" | "snapshot" => 0x2C,
+        "printscreen" => 0x2C,
         "scrolllock" => 0x91,
-        "pause" | "break" => 0x13,
+        "pause" => 0x13,
         "backspace" => 0x08,
         "tab" => 0x09,
-        "enter" | "return" => 0x0D,
-        "esc" | "escape" => 0x1B,
+        "enter" => 0x0D,
+        "escape" => 0x1B,
         "space" => 0x20,
-        "pageup" | "pgup" => 0x21,
-        "pagedown" | "pgdn" => 0x22,
+        "pageup" => 0x21,
+        "pagedown" => 0x22,
         "end" => 0x23,
         "home" => 0x24,
         "left" => 0x25,
         "up" => 0x26,
         "right" => 0x27,
         "down" => 0x28,
-        "insert" | "ins" => 0x2D,
-        "delete" | "del" => 0x2E,
-        "numlock" => 0x90,
-        "-" | "minus" => 0xBD,
-        "=" | "equals" | "plus_key" => 0xBB,
-        "," | "comma" => 0xBC,
-        "." | "period" => 0xBE,
-        ";" | "semicolon" => 0xBA,
-        "/" | "slash" => 0xBF,
-        "`" | "backtick" => 0xC0,
-        "[" => 0xDB,
-        "]" => 0xDD,
-        "\\" => 0xDC,
-        "'" | "quote" => 0xDE,
+        "insert" => 0x2D,
+        "delete" => 0x2E,
+        "numadd" => 0x6B,
+        "numsubtract" => 0x6D,
+        "nummultiply" => 0x6A,
+        "numdivide" => 0x6F,
+        "numdecimal" => 0x6E,
+        "plus" => 0xBB,
+        "minus" => 0xBD,
+        "comma" => 0xBC,
+        "period" => 0xBE,
+        "semicolon" => 0xBA,
+        "slash" => 0xBF,
+        "backquote" => 0xC0,
+        "bracketleft" => 0xDB,
+        "bracketright" => 0xDD,
+        "backslash" => 0xDC,
+        "quote" => 0xDE,
         _ => return None,
     })
 }
@@ -100,6 +92,23 @@ fn key_code(name: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn printscreen_with_every_modifier_combo() {
+        let cases = [
+            ("printscreen", 0),
+            ("ctrl+printscreen", MOD_CONTROL),
+            ("alt+printscreen", MOD_ALT),
+            ("shift+printscreen", MOD_SHIFT),
+            ("ctrl+shift+printscreen", MOD_CONTROL | MOD_SHIFT),
+            ("ctrl+alt+printscreen", MOD_CONTROL | MOD_ALT),
+            ("alt+shift+printscreen", MOD_ALT | MOD_SHIFT),
+            ("PrtSc", 0),
+        ];
+        for (s, m) in cases {
+            assert_eq!(parse(s), Ok(Hotkey { modifiers: m, vk: 0x2C }), "{s}");
+        }
+    }
 
     #[test]
     fn parses_defaults() {
@@ -122,14 +131,14 @@ mod tests {
         assert_eq!(parse("win+f12").unwrap(), Hotkey { modifiers: MOD_WIN, vk: 0x7B });
         assert_eq!(parse("f1").unwrap().vk, 0x70);
         assert_eq!(parse("ctrl+space").unwrap().vk, 0x20);
-        assert_eq!(parse("ctrl+numpad5").unwrap().vk, 0x65);
+        assert_eq!(parse("ctrl+num5").unwrap().vk, 0x65);
     }
 
     #[test]
     fn rejects_garbage() {
         assert!(parse("").is_err());
         assert!(parse("ctrl+shift").is_err());
-        assert!(parse("ctrl++a").is_err());
+        assert_eq!(parse("ctrl+=").unwrap().vk, 0xBB);
         assert!(parse("a+b").is_err());
         assert!(parse("ctrl+blah").is_err());
         assert!(parse("f25").is_err());

@@ -292,6 +292,14 @@ fn finish_image(ctx: &Ctx<'_>, result: &CaptureResult, actions: &[Action]) -> an
     Ok(())
 }
 
+/// Show the workflow's `notify` text (if any) as a tray balloon.
+#[allow(dead_code)] // wired to `WorkflowOutcome::notification` once T04 is merged
+fn show_notification(ctx: &Ctx<'_>, text: Option<String>) {
+    if let Some(t) = text {
+        (ctx.notify)("Jepret", &t);
+    }
+}
+
 fn report_errors(ctx: &Ctx<'_>, errors: &[(String, String)]) {
     if errors.is_empty() {
         return;
@@ -468,7 +476,8 @@ fn recording_thread(
             }
         }
     }
-    drop(border);
+    #[allow(clippy::drop_non_drop)] // RegionBorder gets a Drop impl in T03
+    std::mem::drop(border);
     let stopped = recorder.stop();
     *lock_rec() = None;
     state_changed();

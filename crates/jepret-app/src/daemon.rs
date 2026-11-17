@@ -47,8 +47,8 @@ use windows::{
             DataExchange::COPYDATASTRUCT,
             LibraryLoader::GetModuleHandleW,
             Registry::{
-                RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
-                KEY_SET_VALUE, REG_SZ,
+                RegCloseKey, RegDeleteValueW, RegGetValueW, RegOpenKeyExW, RegSetValueExW, HKEY,
+                HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ, RRF_RT_REG_DWORD,
             },
             Threading::{CreateMutexW, INFINITE},
         },
@@ -77,7 +77,6 @@ const COPYDATA_MAGIC: usize = 0x4A50_5254; // "JPRT"
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_USER_NOTIFY: u32 = WM_APP + 2;
 const WM_REC_STATE: u32 = WM_APP + 3;
-const WM_SPAWN: u32 = WM_APP + 4;
 
 const TIMER_RELOAD: usize = 1;
 const TIMER_REC: usize = 2;
@@ -91,6 +90,10 @@ const ID_KIND_BASE: usize = 100;
 
 static HWND_RAW: AtomicIsize = AtomicIsize::new(0);
 static BUSY: AtomicBool = AtomicBool::new(false);
+/// Set while the last balloon shown was the "PrtSc is used by Snipping Tool"
+/// hint, so a click on it opens the keyboard settings page.
+static SNIP_HINT_ACTIVE: AtomicBool = AtomicBool::new(false);
+const NIN_BALLOONUSERCLICK_EV: u32 = WM_USER + 5;
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 struct Daemon {
@@ -156,6 +159,7 @@ pub fn run() -> anyhow::Result<()> {
         notify_balloon("Jepret: config.toml tidak valid", &format!("Memakai pengaturan default. {e}"), true);
     }
     register_hotkeys(window);
+    check_snipping_tool_conflict(window);
     apply_autostart(&config);
 
     // Startup cleanup on a background thread; never blocks the tray.
@@ -201,7 +205,7 @@ pub fn send_or_run_capture(kind: &str) -> anyhow::Result<()> {
     }
     let config = Config::load(&paths::config_file()).unwrap_or_default();
     let actions = command::actions_for(&config, kind);
-    let ctx = Ctx { config: &config, notify: notify };
+    let ctx = Ctx { config: &config, notify };
     dispatch::handle(&ctx, kind, &actions)
 }
 
@@ -286,6 +290,7 @@ fn base_nid(window: HWND) -> NOTIFYICONDATAW {
 }
 
 fn notify_balloon(title: &str, body: &str, is_error: bool) {
+    SNIP_HINT_ACTIVE.store(false, Ordering::Relaxed);
     let mut nid = base_nid(hwnd());
     nid.uFlags = NIF_INFO;
     nid.dwInfoFlags = if is_error { NIIF_ERROR } else { NIIF_INFO };
@@ -371,7 +376,7 @@ fn icon_pixels(recording: bool) -> Vec<u8> {
 
 fn make_icon(recording: bool) -> isize {
     let px = icon_pixels(recording);
-    let mask = vec![0u8; 32 * 4];
+    let mask = [0u8; 32 * 4];
     // SAFETY: buffers outlive the CreateBitmap calls (they copy the bits); the
     // bitmaps are deleted after CreateIconIndirect copied them.
     unsafe {
@@ -488,6 +493,11 @@ fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> 
             let ev = (lp.0 as u32) & 0xFFFF;
             if ev == WM_CONTEXTMENU || ev == NIN_SELECT {
                 show_menu(h);
+            } else if ev == NIN_BALLOONUSERCLICK_EV && SNIP_HINT_ACTIVE.swap(false, Ordering::Relaxed) {
+                // SAFETY: opens the system settings page; we never change the setting ourselves.
+                unsafe {
+                    ShellExecuteW(h, w!("open"), w!("ms-settings:easeofaccess-keyboard"), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+                }
             }
             Some(LRESULT(0))
         }
@@ -512,10 +522,6 @@ fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> 
                     let _ = KillTimer(h, TIMER_REC);
                 }
             }
-            Some(LRESULT(0))
-        }
-        WM_SPAWN => {
-            spawn_capture(wp.0 as u32, None);
             Some(LRESULT(0))
         }
         WM_TIMER => {
@@ -603,14 +609,22 @@ fn register_hotkeys(h: HWND) {
     let mut problems = Vec::new();
     for (i, b) in d.config.hotkeys.iter().enumerate() {
         match hotkey::parse(&b.keys) {
-            Err(e) => problems.push(e),
+            Err(e) => problems.push(format!(
+                "{}: kombinasi tidak valid ({e}). Ganti di Settings > Hotkey.",
+                b.keys
+            )),
             Ok(hk) => {
                 let id = i as i32 + 1;
                 // SAFETY: registering a hotkey on our own window.
                 let r = unsafe { RegisterHotKey(h, id, HOT_KEY_MODIFIERS(hk.modifiers) | MOD_NOREPEAT, hk.vk) };
                 match r {
                     Ok(()) => d.registered.push(id),
-                    Err(e) => problems.push(format!("{} (sudah dipakai aplikasi lain?): {e}", b.keys)),
+                    Err(e) => {
+                        let pretty = jepret_core::KeyCombo::parse(&b.keys).map(|k| k.pretty()).unwrap_or_else(|_| b.keys.clone());
+                        problems.push(format!(
+                            "{pretty} gagal didaftarkan (mungkin dipakai aplikasi lain): {e}. Ganti kombinasinya di Settings > Hotkey."
+                        ));
+                    }
                 }
             }
         }
@@ -735,9 +749,15 @@ fn show_menu(h: HWND) {
             "Rekam region",
             "Rekam monitor aktif",
         ];
+        let cfg = state().as_ref().map(|d| d.config.clone());
         for (i, label) in labels.iter().enumerate() {
             let target = if i < 6 { cap } else { rec };
-            let _ = AppendMenuW(target, MF_STRING, ID_KIND_BASE + i, PCWSTR(wide(label).as_ptr()));
+            let kind = command::KIND_NAMES[i].1;
+            let text = match cfg.as_deref().and_then(|c| shortcut_label(c, kind)) {
+                Some(sc) => format!("{label}	{sc}"),
+                None => (*label).to_string(),
+            };
+            let _ = AppendMenuW(target, MF_STRING, ID_KIND_BASE + i, PCWSTR(wide(&text).as_ptr()));
         }
         let _ = AppendMenuW(menu, MF_POPUP, cap.0 as usize, w!("Capture"));
         if recording {
@@ -760,6 +780,52 @@ fn show_menu(h: HWND) {
         let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, h, None);
         let _ = PostMessageW(h, WM_NULL, WPARAM(0), LPARAM(0));
         let _ = DestroyMenu(menu); // also destroys attached submenus
+    }
+}
+
+/// Human-readable shortcut of the first binding for `kind` (e.g. `Ctrl+PrtSc`).
+fn shortcut_label(config: &Config, kind: CaptureKind) -> Option<String> {
+    config
+        .hotkeys
+        .iter()
+        .find(|h| h.capture == kind)
+        .and_then(|h| jepret_core::KeyCombo::parse(&h.keys).ok())
+        .map(|k| k.pretty())
+}
+
+/// Windows 11 binds PrtSc to Snipping Tool when this per-user DWORD is 1.
+fn print_screen_opens_snipping_tool() -> bool {
+    let mut data = 0u32;
+    let mut size = 4u32;
+    // SAFETY: reads a DWORD into a properly sized local buffer.
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Control Panel\Keyboard"),
+            w!("PrintScreenKeyForSnippingEnabled"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut data as *mut u32 as *mut _),
+            Some(&mut size),
+        )
+    };
+    r.is_ok() && data == 1
+}
+
+fn check_snipping_tool_conflict(_h: HWND) {
+    let uses_prtsc = state().as_ref().is_some_and(|d| {
+        d.config
+            .hotkeys
+            .iter()
+            .any(|b| jepret_core::KeyCombo::parse(&b.keys).is_ok_and(|k| k.key == "printscreen"))
+    });
+    if uses_prtsc && print_screen_opens_snipping_tool() {
+        notify_balloon(
+            "Jepret: PrtSc dipakai Snipping Tool",
+            "Windows membuka Snipping Tool saat PrtSc ditekan. Klik di sini untuk membuka pengaturan keyboard lalu matikan \"Gunakan tombol Print screen untuk membuka tangkapan layar\".",
+            false,
+        );
+        SNIP_HINT_ACTIVE.store(true, Ordering::Relaxed);
     }
 }
 
