@@ -277,6 +277,7 @@ fn finish_image(ctx: &Ctx<'_>, result: &CaptureResult, actions: &[Action]) -> an
     let wctx = WorkflowContext { config: ctx.config, exe_path: exe_path() };
     let outcome = jepret_workflow::run(&wctx, result, actions).context("workflow")?;
     report_errors(ctx, &outcome.errors);
+    show_notification(ctx, outcome.notification.clone());
     if outcome.saved_permanently {
         if let Some(path) = &outcome.saved_path {
             record_history(
@@ -293,7 +294,6 @@ fn finish_image(ctx: &Ctx<'_>, result: &CaptureResult, actions: &[Action]) -> an
 }
 
 /// Show the workflow's `notify` text (if any) as a tray balloon.
-#[allow(dead_code)] // wired to `WorkflowOutcome::notification` once T04 is merged
 fn show_notification(ctx: &Ctx<'_>, text: Option<String>) {
     if let Some(t) = text {
         (ctx.notify)("Jepret", &t);
@@ -488,7 +488,12 @@ fn recording_thread(
             info!("recording saved: {}", path.display());
             let wctx = WorkflowContext { config: &cfg, exe_path: exe_path() };
             match jepret_workflow::run_for_file(&wctx, &path, &actions) {
-                Ok(outcome) => report_errors(&ctx, &outcome.errors),
+                Ok(outcome) => {
+                    report_errors(&ctx, &outcome.errors);
+                    if let Some(t) = outcome.notification {
+                        notify("Jepret", &t);
+                    }
+                }
                 Err(e) => {
                     warn!("recording workflow failed: {e:#}");
                     notify("Jepret", &format!("Aksi setelah rekaman gagal: {e:#}"));

@@ -599,7 +599,7 @@ fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> 
 /// Free cached D3D11 devices / duplications after ~60 s without a capture.
 fn release_capture_cache() {
     debug!("idle: releasing capture cache");
-    // TODO(merge): jepret_capture::release_cache()
+    jepret_capture::release_cache();
 }
 
 fn shutdown(h: HWND) {

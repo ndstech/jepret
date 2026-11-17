@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/OWNER/jepret"
-rust-version = "1.80"
+rust-version = "1.88"
 
 [workspace.dependencies]
 # internal
@@ -46,7 +46,9 @@ egui = "0.29"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# unwind (not abort): the daemon catches worker panics so one bad capture
+# never kills the tray/hotkeys. Size cost is small.
+panic = "unwind"
 strip = true
 
 [profile.dev.package."*"]

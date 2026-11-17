@@ -7,8 +7,9 @@
 //! Implementation: DXGI Desktop Duplication per output (FP16 on HDR
 //! monitors), with a GDI `BitBlt` fallback for SDR when duplication is
 //! unavailable (rotated outputs, RDP, duplication limit, ...). Monitors are
-//! grabbed in parallel and composed into virtual-desktop space. Nothing is
-//! kept resident between calls (no cached devices / duplications).
+//! grabbed in parallel and composed into virtual-desktop space. D3D devices
+//! and duplication sessions are cached between calls for speed; the daemon
+//! frees them after idle via [`release_cache`].
 //! WGC fallback is not implemented (see T01 report).
 
 pub mod hdr;

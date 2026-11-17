@@ -176,3 +176,8 @@ Laporkan: apa yang dikerjakan, apa yang belum, cara menguji manual.
 _(catat di sini setiap perubahan/penambahan API publik lintas crate)_
 
 - **core:** `keys::KeyCombo` (parser/format kombinasi tombol), `shortcuts::{EDITOR_SHORTCUTS, resolve_editor_keymap, conflicts}`, `config::EditorConfig` (`Config.editor`: shortcuts override, palette, default_tool, show_shortcut_hints). Default hotkey global diganti ke skema PrtSc (PRD F13).
+- **workflow (T04):** `WorkflowOutcome.notification: Option<String>` — `notify` tidak menampilkan toast (exe portable tidak punya AUMID); daemon menampilkannya sebagai balloon tray. Tambahan: `expand_args`.
+- **capture (T01):** `ensure_dpi_aware()`, `release_cache()` (daemon memanggilnya setelah 60 s idle), helper murni `bgra_to_rgba`/`blit`/`compose`.
+- **history (T05):** `HistoryDb::with_thumbs_dir`, `thumbs_dir`, `refresh_missing`. `HistoryDb` Send, bukan Sync.
+- **gallery/settings/overlay/recorder:** hanya modul publik tambahan, signature lama tetap.
+- **workspace:** `rust-version` 1.88 (dipakai `as_chunks`), release `panic = "unwind"` supaya daemon bisa menangkap panic worker.
