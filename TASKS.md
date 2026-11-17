@@ -61,6 +61,7 @@ capture hdr  overlay workflow history editor stitch recorder gallery settings
 ### T03 — Overlay region
 **Implement:** `select_region`, `RegionBorder`.
 - Satu window `WS_POPUP` + `WS_EX_TOPMOST | WS_EX_TOOLWINDOW` seukuran `origin`, Direct2D (`ID2D1HwndRenderTarget` atau DXGI swapchain) menggambar `frozen` + lapisan gelap di luar seleksi.
+- Shortcut overlay lengkap di PRD F13 (Enter/Space, Esc, panah, Ctrl+panah resize, Tab snap, F, A, M, C) + hint bar di bawah layar.
 - Interaksi PRD F3: drag, hover-snap ke `window_rects` (klik tanpa drag = pilih window), magnifier (zoom 8× sekitar kursor + koordinat + ukuran), panah = geser 1 px, Shift+panah = resize, Enter = konfirmasi, Esc / klik kanan = batal, `initial` = seleksi awal.
 - `RegionBorder`: window layered click-through (`WS_EX_TRANSPARENT | WS_EX_LAYERED`), dikecualikan dari capture (`SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`).
 - Tambah `examples/demo.rs` dengan gambar gradien sintetis (tanpa jepret-capture).
@@ -91,7 +92,7 @@ capture hdr  overlay workflow history editor stitch recorder gallery settings
 **Implement:** `run_editor`. Tambah `eframe`, `egui`, `image`, `arboard`.
 - Pisahkan `doc.rs` (model shape + undo/redo, tanpa egui), `render.rs` (flatten shape → `Image`, tanpa egui), `ui.rs`.
 - Tools PRD F8. Blur/pixelate diterapkan saat render dari piksel asli.
-- Shortcut: Ctrl+Z/Y, Ctrl+C (copy hasil), Ctrl+S, Ctrl+Shift+S, Enter (copy & tutup), Esc (tutup, konfirmasi kalau ada perubahan), angka 1–9 pilih tool.
+- **Shortcut (PRD F13):** dispatch berdasarkan id dari `jepret_core::shortcuts::EDITOR_SHORTCUTS`, keymap dari `resolve_editor_keymap(&config.editor.shortcuts)`. Semua id wajib terimplementasi. Gestur tetap (Shift/Alt/Space/Ctrl+wheel, Esc bertingkat, mode ketik teks). Cheat-sheet F1 di-generate dari katalog. Tooltip/menu menampilkan `KeyCombo::pretty()`. Palet dari `config.editor.palette`, tool awal `config.editor.default_tool`. Esc tutup → konfirmasi kalau ada perubahan belum disimpan.
 - `examples/open.rs <file>`.
 
 **AC:** unit test `doc` (undo/redo) & `render` (kotak di posisi benar, pixelate mengubah area saja); buka PNG 4K ≤ 300 ms (release).
@@ -130,6 +131,7 @@ capture hdr  overlay workflow history editor stitch recorder gallery settings
 ### T11 — Settings UI
 **Implement:** `run_settings`. Tambah `eframe`, `egui`.
 - Tab: Umum · Hotkey & Workflow (list hotkey; tiap hotkey: perekam kombinasi tombol, pilih capture kind, daftar action yang bisa diurutkan) · Aplikasi eksternal (tambah dari file picker atau `open_with_candidates`) · History & Cleanup · Recording · Capture.
+- **Tab Shortcut (PRD F13):** tabel hotkey global + semua `EDITOR_SHORTCUTS` (dikelompokkan per `group`), pencarian, tombol "rekam" (tangkap kombinasi yang ditekan), reset per baris & semua, peringatan bentrok (`shortcuts::conflicts`, dan antar hotkey global). Parsing/format pakai `jepret_core::KeyCombo`. Override disimpan ke `config.editor.shortcuts` hanya bila beda dari default.
 - Validasi: hotkey duplikat, path app tidak ada. Simpan via `Config::save`.
 
 **AC:** semua field `Config` bisa diubah; file hasil bisa dimuat ulang `Config::load` identik.
@@ -140,6 +142,7 @@ capture hdr  overlay workflow history editor stitch recorder gallery settings
 - Threading: message loop di main thread (tray + hotkey + overlay). Capture → overlay di main thread, workflow & history di worker thread.
 - Last region disimpan ke `AppState`. Recording toggle + `RegionBorder` + ikon tray merah.
 - Cleanup harian di thread latar.
+- **Shortcut (PRD F13):** parse `HotkeyBinding.keys` dengan `jepret_core::KeyCombo` (jangan parser sendiri). Default baru berbasis PrtSc. Deteksi `PrintScreenKeyForSnippingEnabled` → notifikasi + buka `ms-settings:easeofaccess-keyboard`. Hotkey gagal daftar → notifikasi berisi kombinasinya. Menu tray menampilkan shortcut tiap aksi (`pretty()`).
 
 **AC:** RAM idle ≤ 20 MB (release), CPU idle 0%; semua hotkey default bekerja; instance kedua `jepret capture region` diteruskan ke daemon.
 
@@ -172,4 +175,4 @@ Laporkan: apa yang dikerjakan, apa yang belum, cara menguji manual.
 ## Contract changes
 _(catat di sini setiap perubahan/penambahan API publik lintas crate)_
 
-- —
+- **core:** `keys::KeyCombo` (parser/format kombinasi tombol), `shortcuts::{EDITOR_SHORTCUTS, resolve_editor_keymap, conflicts}`, `config::EditorConfig` (`Config.editor`: shortcuts override, palette, default_tool, show_shortcut_hints). Default hotkey global diganti ke skema PrtSc (PRD F13).
