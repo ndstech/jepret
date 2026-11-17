@@ -9,16 +9,25 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod command;
 mod daemon;
 mod dispatch;
+mod hotkey;
 
 use std::path::PathBuf;
 
 use jepret_core::{paths, Config};
 
 fn main() -> anyhow::Result<()> {
-    // TODO(T12): SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2) first,
-    // then logging (tracing-appender to paths::logs_dir()).
+    // The embedded manifest (build.rs) already declares PerMonitorV2; this call
+    // covers `cargo run` setups where the manifest is missing. Failure = already set.
+    // SAFETY: plain Win32 call, no pointers.
+    unsafe {
+        let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+            windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        );
+    }
+    init_logging();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let config_path = paths::config_file();
 
@@ -40,4 +49,30 @@ fn main() -> anyhow::Result<()> {
         None => daemon::run(),
         Some(other) => anyhow::bail!("unknown argument: {other}"),
     }
+}
+
+/// Daily-rolling log file in `paths::logs_dir()` (last 7 files). Failure to
+/// set up logging is never fatal.
+fn init_logging() {
+    let dir = paths::logs_dir();
+    if paths::ensure_dir(&dir).is_err() {
+        return;
+    }
+    let Ok(appender) = tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("jepret")
+        .filename_suffix("log")
+        .max_log_files(7)
+        .build(&dir)
+    else {
+        return;
+    };
+    let filter = tracing_subscriber::EnvFilter::try_from_env("JEPRET_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::sync::Mutex::new(appender))
+        .with_ansi(false)
+        .with_env_filter(filter)
+        .try_init();
+    std::panic::set_hook(Box::new(|info| tracing::error!("panic: {info}")));
 }
