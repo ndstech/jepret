@@ -16,10 +16,16 @@ use egui::{
 };
 use jepret_core::config::ExternalApp;
 use jepret_core::keys::KeyCombo;
+use jepret_core::shortcuts::{editor_shortcut, EDITOR_SHORTCUTS};
+use jepret_ui_theme::tokens::{
+    CONTROL_H, RADIUS_CONTROL, RADIUS_PANEL, SP_1, SP_2, SP_3, SP_4, TEXT_BODY, TEXT_SMALL, TOOL_BTN,
+};
+use jepret_ui_theme::widgets::{button, kbd, primary_button, section_header, toggle, IconButton};
+use jepret_ui_theme::{icons, Icon, Palette};
 use jepret_core::{Config, Image, Rect};
 
 use crate::doc::{Pt, Shape, ShapeKind, Tool};
-use crate::input::{combo_from_key, Keymap, FIXED_GESTURES};
+use crate::input::{combo_from_key, Keymap};
 use crate::session::{constrain_drag, DragKind, Effect, Session, ZoomCmd};
 use crate::{io, render};
 
@@ -36,6 +42,7 @@ struct TextEdit {
 pub struct EditorApp {
     path: PathBuf,
     config: Config,
+    pal: Palette,
     keymap: Keymap,
     base: Option<Arc<Image>>,
     load_rx: Option<Receiver<LoadResult>>,
@@ -58,6 +65,8 @@ pub struct EditorApp {
     confirm_close: bool,
     force_close: bool,
     show_help: bool,
+    help_query: String,
+    help_was_open: bool,
     open_with_menu: bool,
     status: String,
     last_title_dirty: Option<bool>,
@@ -81,6 +90,7 @@ impl EditorApp {
         let s = Session::new(&config.editor);
         Self {
             path,
+            pal: Palette::for_mode(config.general.theme),
             config,
             keymap,
             base: None,
@@ -101,6 +111,8 @@ impl EditorApp {
             confirm_close: false,
             force_close: false,
             show_help: false,
+            help_query: String::new(),
+            help_was_open: false,
             open_with_menu: false,
             status: String::new(),
             last_title_dirty: None,
@@ -401,6 +413,10 @@ impl EditorApp {
                 continue;
             }
             let Some((id, big)) = self.keymap.resolve(&combo) else { continue };
+            // The cheat-sheet has a search box: typing must not fire shortcuts.
+            if self.show_help && !(id == "file.close" || (id == "view.cheatsheet" && combo.key == "f1")) {
+                continue;
+            }
             let repeatable = id.starts_with("edit.nudge")
                 || id.starts_with("style.width")
                 || id == "edit.undo"
@@ -415,151 +431,349 @@ impl EditorApp {
 
     // ---- panels ----------------------------------------------------------
 
+    /// Optional shortcut text for a button, honouring `show_shortcut_hints`.
+    fn sc(&self, id: &str) -> Option<String> {
+        let h = self.keymap.hint(id);
+        (self.config.editor.show_shortcut_hints && !h.is_empty()).then_some(h)
+    }
+
+    /// Top/bottom/left/right panels (the central canvas is added after).
     fn toolbar(&mut self, ctx: &Context) {
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                for (n, t) in Tool::ALL.iter().enumerate() {
-                    let hint = self.keymap.hint(t.id());
-                    let label = if self.config.editor.show_shortcut_hints && !hint.is_empty() {
-                        format!("{} {hint}", t.label())
-                    } else {
-                        t.label().to_string()
-                    };
-                    let r = ui.selectable_label(self.s.tool == *t, label).on_hover_text(self.tip(t.label(), t.id()));
-                    if r.clicked() {
-                        self.commit_text();
-                        self.run_command(ctx, t.id(), false);
+        let pal = self.pal;
+        let cmd = self.command_bar(ctx);
+        let status = self.status_bar(ctx);
+        let tools = self.tool_panel(ctx);
+        let props = self.props_panel(ctx);
+        // 1 px separators drawn on top of the panel fills.
+        let p = ctx.layer_painter(egui::LayerId::background());
+        let line = Stroke::new(1.0_f32, pal.line);
+        p.hline(cmd.x_range(), cmd.bottom() - 0.5, line);
+        p.hline(status.x_range(), status.top() + 0.5, line);
+        p.vline(tools.right() - 0.5, tools.y_range(), line);
+        p.vline(props.left() + 0.5, props.y_range(), line);
+    }
+
+    fn command_bar(&mut self, ctx: &Context) -> ERect {
+        let pal = self.pal;
+        let (h_undo, h_redo) = (self.sc("edit.undo"), self.sc("edit.redo"));
+        let (h_copy, h_save, h_open, h_close) =
+            (self.sc("file.copy"), self.sc("file.save"), self.sc("file.open_with"), self.sc("file.copy_close"));
+        let info = self.info_text();
+        let can_undo = self.s.doc.can_undo();
+        let can_redo = self.s.doc.can_redo();
+        let has_crop = self.s.doc.crop().is_some();
+        let mut cmd: Option<&'static str> = None;
+        let mut reset_crop = false;
+        let r = egui::TopBottomPanel::top("cmdbar")
+            .exact_height(52.0)
+            .frame(egui::Frame::none().fill(pal.surface).inner_margin(egui::Margin::symmetric(SP_3, 0.0)))
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = SP_2;
+                    ui.add_enabled_ui(can_undo, |ui| {
+                        if IconButton::new(Icon::Undo, "Undo").shortcut(h_undo.as_deref()).show(ui, &pal).clicked() {
+                            cmd = Some("edit.undo");
+                        }
+                    });
+                    ui.add_enabled_ui(can_redo, |ui| {
+                        if IconButton::new(Icon::Redo, "Redo").shortcut(h_redo.as_deref()).show(ui, &pal).clicked() {
+                            cmd = Some("edit.redo");
+                        }
+                    });
+                    let (sep, _) = ui.allocate_exact_size(vec2(1.0, 24.0), Sense::hover());
+                    ui.painter().rect_filled(sep, 0.0, pal.line);
+                    ui.label(egui::RichText::new(info).size(TEXT_SMALL).color(pal.muted));
+                    if has_crop && button(ui, &pal, None, "Reset crop", None).clicked() {
+                        reset_crop = true;
                     }
-                    if n == 1 || n == 6 || n == 11 {
-                        ui.separator();
-                    }
-                }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if primary_button(ui, &pal, "Copy & tutup", h_close.as_deref()).clicked() {
+                            cmd = Some("file.copy_close");
+                        }
+                        if button(ui, &pal, Some(Icon::OpenExternal), "Buka di…", h_open.as_deref()).clicked() {
+                            cmd = Some("file.open_with");
+                        }
+                        if button(ui, &pal, Some(Icon::Save), "Simpan", h_save.as_deref()).clicked() {
+                            cmd = Some("file.save");
+                        }
+                        if button(ui, &pal, Some(Icon::Copy), "Copy", h_copy.as_deref()).clicked() {
+                            cmd = Some("file.copy");
+                        }
+                    });
+                });
             });
-            ui.horizontal_wrapped(|ui| {
-                let btn = |app: &mut Self, ui: &mut egui::Ui, text: &str, id: &str, enabled: bool| -> bool {
-                    ui.add_enabled(enabled, egui::Button::new(text)).on_hover_text(app.tip(text, id)).clicked()
-                };
-                if btn(self, ui, "Undo", "edit.undo", self.s.doc.can_undo()) {
-                    self.run_command(ctx, "edit.undo", false);
-                }
-                if btn(self, ui, "Redo", "edit.redo", self.s.doc.can_redo()) {
-                    self.run_command(ctx, "edit.redo", false);
-                }
-                ui.separator();
-                self.properties(ui, ctx);
-                ui.separator();
-                let has_sel = !self.s.selection().is_empty();
-                if btn(self, ui, "Delete", "edit.delete", has_sel) {
-                    self.run_command(ctx, "edit.delete", false);
-                }
-                if btn(self, ui, "Duplicate", "edit.duplicate", has_sel) {
-                    self.run_command(ctx, "edit.duplicate", false);
-                }
-                if btn(self, ui, "Front", "edit.bring_front", has_sel) {
-                    self.run_command(ctx, "edit.bring_front", false);
-                }
-                if btn(self, ui, "Back", "edit.send_back", has_sel) {
-                    self.run_command(ctx, "edit.send_back", false);
-                }
-                if ui.add_enabled(self.s.doc.crop().is_some(), egui::Button::new("Reset crop")).clicked() {
-                    self.s.doc.set_crop(None);
-                }
-                ui.separator();
-                for (text, id) in [
-                    ("Save", "file.save"),
-                    ("Save As...", "file.save_as"),
-                    ("Copy", "file.copy"),
-                    ("Copy & close", "file.copy_close"),
-                    ("Open with...", "file.open_with"),
-                    ("Folder", "file.open_folder"),
-                ] {
-                    if btn(self, ui, text, id, true) {
-                        self.run_command(ctx, id, false);
-                    }
-                }
-                ui.separator();
-                for (text, id) in [("Fit", "view.zoom_fit"), ("100%", "view.zoom_100"), ("?", "view.cheatsheet")] {
-                    if btn(self, ui, text, id, true) {
-                        self.run_command(ctx, id, false);
-                    }
-                }
-                ui.label(format!("{:.0}%", self.zoom * ctx.pixels_per_point() * 100.0));
-            });
-        });
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                let dirty = if self.s.doc.is_dirty() { " *" } else { "" };
-                ui.label(format!("{}{dirty}", self.path.display()));
-                if let Some(b) = &self.base {
-                    ui.separator();
-                    let (w, h) = match self.s.doc.crop() {
-                        Some(c) => (c.width, c.height),
-                        None => (b.width, b.height),
-                    };
-                    ui.label(format!("{w} x {h}"));
-                }
-                if !self.status.is_empty() {
-                    ui.separator();
-                    ui.label(&self.status);
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let h = self.keymap.hint("view.cheatsheet");
-                    if !h.is_empty() {
-                        ui.weak(format!("{h}: shortcuts"));
+        if reset_crop {
+            self.s.doc.set_crop(None);
+        }
+        if let Some(id) = cmd {
+            self.commit_text();
+            self.run_command(ctx, id, false);
+        }
+        r.response.rect
+    }
+
+    /// "Panah · warna 1 · tebal 4 px"
+    fn info_text(&self) -> String {
+        let tool = self.s.style_tool();
+        let name = editor_shortcut(tool.id()).map(|d| d.label).unwrap_or(tool.label());
+        let cur = self.s.color_now();
+        let color = match self.s.palette.iter().take(9).position(|c| c[..3] == cur[..3]) {
+            Some(i) => format!("warna {}", i + 1),
+            None => "warna kustom".to_string(),
+        };
+        let (kind, unit) = self.width_kind();
+        format!("{name} · {color} · {} {:.0}{unit}", kind.to_lowercase(), self.s.width_now())
+    }
+
+    /// Label and unit of the width knob for the active tool / selection.
+    fn width_kind(&self) -> (&'static str, &'static str) {
+        let sel_kind = self.s.selection().first().and_then(|i| self.s.doc.shapes().get(*i)).map(|s| &s.kind);
+        match (self.s.style_tool(), sel_kind) {
+            (Tool::Blur | Tool::Pixelate, _) | (_, Some(ShapeKind::Blur { .. } | ShapeKind::Pixelate { .. })) => {
+                ("Kekuatan", "")
+            }
+            (Tool::Text | Tool::Step, _) | (_, Some(ShapeKind::Text { .. } | ShapeKind::Step { .. })) => ("Ukuran", ""),
+            _ => ("Tebal", " px"),
+        }
+    }
+
+    fn tool_tooltip(t: Tool) -> String {
+        let name = editor_shortcut(t.id()).map(|d| d.label).unwrap_or(t.label());
+        match t {
+            Tool::Arrow | Tool::Line => format!("{name} · Shift = lurus 45°"),
+            Tool::Rect | Tool::Ellipse | Tool::Highlight | Tool::Blur | Tool::Pixelate => {
+                format!("{name} · Shift = proporsional · Alt = dari tengah")
+            }
+            _ => name.to_string(),
+        }
+    }
+
+    fn tool_panel(&mut self, ctx: &Context) -> ERect {
+        let pal = self.pal;
+        let mut picked: Option<Tool> = None;
+        let r = egui::SidePanel::left("tools")
+            .exact_width(56.0)
+            .resizable(false)
+            .frame(egui::Frame::none().fill(pal.surface).inner_margin(egui::Margin { top: 10.0, ..Default::default() }))
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.vertical_centered(|ui| {
+                    for (t, (icon, _)) in Tool::ALL.iter().zip(Icon::TOOLS.iter()) {
+                        let hint = self.sc(t.id());
+                        let tip = Self::tool_tooltip(*t);
+                        let b = IconButton::new(*icon, &tip)
+                            .size(TOOL_BTN)
+                            .selected(self.s.tool == *t)
+                            .shortcut(hint.as_deref())
+                            .corner_key(true);
+                        if b.show(ui, &pal).clicked() {
+                            picked = Some(*t);
+                        }
                     }
                 });
             });
-        });
+        if let Some(t) = picked {
+            self.commit_text();
+            self.run_command(ctx, t.id(), false);
+        }
+        r.response.rect
     }
 
-    /// Palette swatches, colour picker, width slider, fill/shadow.
-    fn properties(&mut self, ui: &mut egui::Ui, ctx: &Context) {
+    fn status_bar(&mut self, ctx: &Context) -> ERect {
+        let pal = self.pal;
+        let size = self.base.as_ref().map(|b| match self.s.doc.crop() {
+            Some(c) => (c.width, c.height),
+            None => (b.width, b.height),
+        });
+        let zoom = self.zoom * ctx.pixels_per_point() * 100.0;
+        let (h_fit, h_100, h_help) =
+            (self.keymap.hint("view.zoom_fit"), self.keymap.hint("view.zoom_100"), self.keymap.hint("view.cheatsheet"));
+        let count = self.s.doc.shapes().len();
+        let r = egui::TopBottomPanel::bottom("status")
+            .exact_height(28.0)
+            .frame(egui::Frame::none().fill(pal.surface).inner_margin(egui::Margin::symmetric(14.0, 0.0)))
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = SP_4;
+                    let muted = |t: String| egui::RichText::new(t).size(TEXT_SMALL).color(pal.muted);
+                    let mono = |t: &str| egui::RichText::new(t.to_owned()).font(FontId::monospace(10.0)).color(pal.muted);
+                    if let Some((w, h)) = size {
+                        ui.label(muted(format!("{w} × {h} px")));
+                    }
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = SP_1;
+                        ui.label(muted(format!("Zoom {zoom:.0}%")));
+                        if !h_fit.is_empty() {
+                            ui.label(mono(&h_fit));
+                            ui.label(muted("pas ·".into()));
+                        }
+                        if !h_100.is_empty() {
+                            ui.label(mono(&h_100));
+                            ui.label(muted("100%".into()));
+                        }
+                    });
+                    ui.label(muted(format!("{count} objek")));
+                    if !self.status.is_empty() {
+                        ui.label(egui::RichText::new(&self.status).size(TEXT_SMALL).color(pal.text));
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = SP_2;
+                        if !h_help.is_empty() {
+                            ui.label(egui::RichText::new("Semua shortcut").size(TEXT_SMALL).color(pal.text));
+                            kbd(ui, &pal, &h_help);
+                        }
+                        ui.label(muted("Space+drag geser · Ctrl+scroll zoom".into()));
+                    });
+                });
+            });
+        r.response.rect
+    }
+
+    fn props_panel(&mut self, ctx: &Context) -> ERect {
+        let pal = self.pal;
+        let r = egui::SidePanel::right("props")
+            .exact_width(248.0)
+            .resizable(false)
+            .frame(egui::Frame::none().fill(pal.surface).inner_margin(egui::Margin::same(SP_4)))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 10.0;
+                    self.style_section(ui, ctx);
+                    self.object_section(ui, ctx);
+                });
+            });
+        r.response.rect
+    }
+
+    /// Colour swatches, width slider, fill/shadow toggles.
+    fn style_section(&mut self, ui: &mut egui::Ui, ctx: &Context) {
+        let pal = self.pal;
+        // Crop has no style; keep the panel quiet until something is selected.
         if self.s.tool == Tool::Crop && self.s.selection().is_empty() {
             return;
         }
+        section_header(ui, &pal, "Warna");
         let palette = self.s.palette.clone();
-        for (i, c) in palette.iter().take(9).enumerate() {
-            let fill = Color32::from_rgba_unmultiplied(c[0], c[1], c[2], 255);
-            let lum = 0.299 * c[0] as f32 + 0.587 * c[1] as f32 + 0.114 * c[2] as f32;
-            let txt = if lum > 140.0 { Color32::BLACK } else { Color32::WHITE };
-            let id = format!("style.color_{}", i + 1);
-            let b = egui::Button::new(egui::RichText::new((i + 1).to_string()).color(txt).small())
-                .fill(fill)
-                .min_size(vec2(18.0, 18.0));
-            if ui.add(b).on_hover_text(self.tip(&format!("Color {}", i + 1), &id)).clicked() {
-                self.run_command(ctx, &id, false);
-            }
+        let cur = self.s.color_now();
+        let cell = ((ui.available_width() - 4.0 * SP_2) / 5.0).floor();
+        let mut cur32 = Color32::from_rgba_unmultiplied(cur[0], cur[1], cur[2], cur[3]);
+        let mut picker_changed = false;
+        ui.spacing_mut().item_spacing = vec2(SP_2, SP_2);
+        for row in 0..2 {
+            ui.horizontal(|ui| {
+                for col in 0..5 {
+                    let i = row * 5 + col;
+                    if i < 9 {
+                        let Some(c) = palette.get(i) else { continue };
+                        let fill = Color32::from_rgb(c[0], c[1], c[2]);
+                        let (rect, resp) = ui.allocate_exact_size(vec2(cell, 34.0), Sense::click());
+                        let on = c[..3] == cur[..3];
+                        let stroke = if on { Stroke::new(2.0_f32, pal.text) } else { Stroke::new(1.0_f32, pal.line) };
+                        ui.painter().rect(rect, RADIUS_CONTROL, fill, stroke);
+                        let lum = 0.299 * c[0] as f32 + 0.587 * c[1] as f32 + 0.114 * c[2] as f32;
+                        // Dark label on light swatches, white on dark ones.
+                        let label = if lum > 140.0 { Palette::LIGHT.text } else { Color32::WHITE };
+                        ui.painter().text(
+                            rect.right_bottom() - vec2(3.0, 1.0),
+                            Align2::RIGHT_BOTTOM,
+                            (i + 1).to_string(),
+                            FontId::monospace(9.0),
+                            label,
+                        );
+                        let id = format!("style.color_{}", i + 1);
+                        if resp.on_hover_text(self.tip(&format!("Warna {}", i + 1), &id)).clicked() {
+                            self.run_command(ctx, &id, false);
+                        }
+                    } else if i == 9 {
+                        let (rect, resp) = ui.allocate_exact_size(vec2(cell, 34.0), Sense::click());
+                        if resp.hovered() {
+                            ui.painter().rect_filled(rect, RADIUS_CONTROL, pal.raised);
+                        }
+                        let b = rect.shrink(0.5);
+                        let pts = [b.left_top(), b.right_top(), b.right_bottom(), b.left_bottom(), b.left_top()];
+                        ui.painter().extend(EShape::dashed_line(&pts, Stroke::new(1.0_f32, pal.line_strong), 4.0, 3.0));
+                        ui.painter().text(rect.center(), Align2::CENTER_CENTER, "+", FontId::proportional(16.0), pal.muted);
+                        let pid = ui.make_persistent_id("custom_color");
+                        if resp.clone().on_hover_text("Warna lain").clicked() {
+                            ui.memory_mut(|m| m.toggle_popup(pid));
+                        }
+                        egui::popup::popup_below_widget(
+                            ui,
+                            pid,
+                            &resp,
+                            egui::PopupCloseBehavior::CloseOnClickOutside,
+                            |ui| {
+                                picker_changed = egui::color_picker::color_picker_color32(
+                                    ui,
+                                    &mut cur32,
+                                    egui::color_picker::Alpha::OnlyBlend,
+                                );
+                            },
+                        );
+                    }
+                }
+            });
         }
 
-        let cur = self.s.color_now();
-        let mut c32 = Color32::from_rgba_unmultiplied(cur[0], cur[1], cur[2], cur[3]);
-        let r1 = ui.color_edit_button_srgba(&mut c32);
+        ui.add_space(SP_2);
+        let (kind, unit) = self.width_kind();
         let mut width = self.s.width_now();
-        let sel_kind = self.s.selection().first().and_then(|i| self.s.doc.shapes().get(*i)).map(|s| s.kind.clone());
-        let label = match (self.s.style_tool(), sel_kind) {
-            (Tool::Blur | Tool::Pixelate, _) | (_, Some(ShapeKind::Blur { .. } | ShapeKind::Pixelate { .. })) => "Strength",
-            (Tool::Text | Tool::Step, _) | (_, Some(ShapeKind::Text { .. } | ShapeKind::Step { .. })) => "Size",
-            _ => "Width",
-        };
-        let r2 = ui.add(egui::Slider::new(&mut width, crate::session::MIN_WIDTH..=crate::session::MAX_WIDTH).text(label));
-        if r1.changed() || r2.changed() {
+        ui.horizontal(|ui| {
+            section_header(ui, &pal, kind);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = SP_1;
+                let (up, down) = (self.keymap.hint("style.width_up"), self.keymap.hint("style.width_down"));
+                if !up.is_empty() || !down.is_empty() {
+                    ui.label(egui::RichText::new(format!("{down} {up}")).font(FontId::monospace(10.0)).color(pal.muted));
+                }
+                ui.label(egui::RichText::new(format!("{width:.0}{unit}")).size(TEXT_SMALL));
+            });
+        });
+        let slider_changed = width_slider(ui, &pal, &mut width);
+
+        if picker_changed || slider_changed {
             if !self.s.selection().is_empty() && !self.prop_editing {
                 self.s.doc.begin_edit();
                 self.prop_editing = true;
             }
-            let [r, g, b, a] = c32.to_srgba_unmultiplied();
-            self.s.live_style(r1.changed().then_some([r, g, b, a]), r2.changed().then_some(width));
+            let [r, g, b, a] = cur32.to_srgba_unmultiplied();
+            self.s.live_style(picker_changed.then_some([r, g, b, a]), slider_changed.then_some(width));
         }
         if ui.input(|i| !i.pointer.any_down()) {
             self.prop_editing = false;
         }
+
+        ui.add_space(SP_2);
+        ui.spacing_mut().item_spacing.y = SP_1;
         let mut fill = self.s.fill_now();
-        if ui.checkbox(&mut fill, "Fill").on_hover_text(self.tip("Fill / outline", "style.toggle_fill")).changed() {
+        let h = self.sc("style.toggle_fill");
+        if toggle(ui, &pal, &mut fill, "Isi bentuk", h.as_deref()).changed() {
             self.s.apply_fill(fill);
         }
         let mut sh = self.s.shadow_now();
-        if ui.checkbox(&mut sh, "Shadow").on_hover_text(self.tip("Shadow", "style.toggle_shadow")).changed() {
+        let h = self.sc("style.toggle_shadow");
+        if toggle(ui, &pal, &mut sh, "Bayangan", h.as_deref()).changed() {
             self.s.apply_shadow(sh);
+        }
+        ui.add_space(SP_2);
+    }
+
+    fn object_section(&mut self, ui: &mut egui::Ui, ctx: &Context) {
+        let pal = self.pal;
+        let has_sel = !self.s.selection().is_empty();
+        ui.add_space(SP_2);
+        section_header(ui, &pal, "Objek terpilih");
+        ui.spacing_mut().item_spacing.y = SP_2;
+        for (label, id) in [
+            ("Duplikat", "edit.duplicate"),
+            ("Ke depan", "edit.bring_front"),
+            ("Ke belakang", "edit.send_back"),
+            ("Hapus", "edit.delete"),
+        ] {
+            let h = self.keymap.hint(id);
+            if list_button(ui, &pal, label, &h, has_sel).clicked() {
+                self.run_command(ctx, id, false);
+            }
         }
     }
 
@@ -620,42 +834,202 @@ impl EditorApp {
         }
     }
 
+    fn open_settings(&mut self) {
+        let r = std::env::current_exe().and_then(|exe| std::process::Command::new(exe).arg("--settings").spawn());
+        if let Err(e) = r {
+            self.status = format!("Tidak bisa membuka Settings: {e}");
+        }
+    }
+
+    /// Rows for the cheat-sheet from the *resolved* keymap, grouped into the
+    /// design's four columns. Repetitive ids (colours 1-9, width up/down,
+    /// nudges, front/back) collapse into one row like the mockup.
+    fn cheat_columns(&self) -> Vec<(&'static str, Vec<(String, String)>)> {
+        let km = &self.keymap;
+        let none = |s: String| if s.is_empty() { "—".to_string() } else { s };
+        let mut cols: Vec<(&'static str, Vec<(String, String)>)> =
+            vec![("Tool", vec![]), ("Gaya & edit", vec![]), ("Tampilan", vec![]), ("File", vec![])];
+        for def in EDITOR_SHORTCUTS {
+            let (label, keys) = match def.id {
+                "style.color_1" => ("Warna palet".to_string(), format!("{} – {}", km.hint("style.color_1"), km.hint("style.color_9"))),
+                id if id.starts_with("style.color_") => continue,
+                "style.width_up" => (
+                    "Tebal / tipis".to_string(),
+                    format!("{} / {}", km.hint("style.width_up"), km.hint("style.width_down")),
+                ),
+                "style.width_down" => continue,
+                "edit.nudge_left" => (
+                    "Geser (Shift ×10)".to_string(),
+                    ["left", "up", "down", "right"].iter().map(|d| km.hint(&format!("edit.nudge_{d}"))).collect::<Vec<_>>().join(" "),
+                ),
+                id if id.starts_with("edit.nudge_") => continue,
+                "edit.bring_front" => (
+                    "Ke depan / belakang".to_string(),
+                    format!("{} / {}", km.hint("edit.bring_front"), km.hint("edit.send_back")),
+                ),
+                "edit.send_back" => continue,
+                id => (def.label.to_string(), none(km.hint_all(id))),
+            };
+            let col = match def.group {
+                "Tool" => 0,
+                "Gaya" | "Edit" => 1,
+                "Tampilan" => 2,
+                _ => 3,
+            };
+            cols[col].1.push((label, keys));
+        }
+        cols
+    }
+
     fn cheatsheet(&mut self, ctx: &Context) {
         if !self.show_help {
+            self.help_was_open = false;
             return;
         }
-        let mut open = true;
-        egui::Window::new("Shortcuts")
-            .open(&mut open)
-            .default_width(520.0)
-            .default_height(520.0)
+        let pal = self.pal;
+        let first = !self.help_was_open;
+        if first {
+            self.help_query.clear();
+        }
+        self.help_was_open = true;
+        let screen = ctx.screen_rect();
+
+        // Scrim: dims the editor and swallows pointer input.
+        let mut close = false;
+        let scrim_clicked = egui::Area::new(egui::Id::new("help_scrim"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click_and_drag());
+                ui.painter().rect_filled(rect, 0.0, Color32::from_black_alpha(if pal.dark { 153 } else { 110 }));
+                resp.clicked()
+            })
+            .inner;
+
+        let width = (screen.width() - 48.0).clamp(360.0, 1040.0);
+        let ncols = if width >= 900.0 { 4 } else if width >= 560.0 { 2 } else { 1 };
+        let query = self.help_query.to_lowercase();
+        let matches = |label: &str, keys: &str| {
+            query.is_empty() || label.to_lowercase().contains(&query) || keys.to_lowercase().contains(&query)
+        };
+        let mut groups: Vec<(&str, Vec<(String, String)>)> = self
+            .cheat_columns()
+            .into_iter()
+            .map(|(g, rows)| (g, rows.into_iter().filter(|(l, k)| matches(l, k)).collect()))
+            .collect();
+        groups.retain(|(_, r)| !r.is_empty());
+        let gestures: Vec<&(&str, &str)> = GESTURES.iter().filter(|(k, v)| matches(k, v)).collect();
+
+        let mut query_edit = std::mem::take(&mut self.help_query);
+        let mut open_settings = false;
+        let dialog = egui::Area::new(egui::Id::new("help_dialog"))
+            .order(egui::Order::Foreground)
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (group, rows) in self.keymap.cheatsheet() {
-                        ui.heading(group);
-                        egui::Grid::new(format!("cs-{group}")).num_columns(2).striped(true).show(ui, |ui| {
-                            for (label, keys) in rows {
-                                ui.label(label);
-                                ui.monospace(keys);
-                                ui.end_row();
+                egui::Frame::none()
+                    .fill(pal.surface)
+                    .stroke(Stroke::new(1.0_f32, pal.line))
+                    .rounding(RADIUS_PANEL)
+                    .shadow(egui::epaint::Shadow {
+                        offset: vec2(0.0, 16.0),
+                        blur: 48.0,
+                        spread: 0.0,
+                        color: Color32::from_black_alpha(if pal.dark { 128 } else { 60 }),
+                    })
+                    .inner_margin(egui::Margin::symmetric(28.0, 24.0))
+                    .show(ui, |ui| {
+                        ui.set_width(width - 56.0);
+                        ui.spacing_mut().item_spacing = vec2(SP_3, 0.0);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Shortcut editor").size(18.0).strong());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let (rect, x) = ui.allocate_exact_size(Vec2::splat(CONTROL_H), Sense::click());
+                                ui.painter().rect_filled(rect, RADIUS_CONTROL, if x.hovered() { pal.line } else { pal.raised });
+                                icons::paint(ui.painter(), ERect::from_center_size(rect.center(), Vec2::splat(14.0)), Icon::Close, pal.text, 1.75);
+                                if x.on_hover_text("Tutup (Esc)").clicked() {
+                                    close = true;
+                                }
+                                if ui.link("Ubah di Settings").clicked() {
+                                    open_settings = true;
+                                }
+                                // Search field.
+                                let (rect, _) = ui.allocate_exact_size(vec2(260.0, CONTROL_H), Sense::hover());
+                                ui.painter().rect(rect, RADIUS_CONTROL, pal.bg, Stroke::new(1.0_f32, pal.line));
+                                icons::paint(
+                                    ui.painter(),
+                                    ERect::from_center_size(pos2(rect.left() + 18.0, rect.center().y), Vec2::splat(14.0)),
+                                    Icon::Search,
+                                    pal.muted,
+                                    2.0,
+                                );
+                                let inner = ERect::from_min_max(pos2(rect.left() + 32.0, rect.top()), rect.max - vec2(6.0, 0.0));
+                                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                                let te = egui::TextEdit::singleline(&mut query_edit)
+                                    .frame(false)
+                                    .hint_text("Cari aksi atau tombol…")
+                                    .desired_width(inner.width())
+                                    .margin(vec2(0.0, 6.0));
+                                let r = child.add(te);
+                                if first {
+                                    r.request_focus();
+                                }
+                            });
+                        });
+                        ui.add_space(18.0);
+                        egui::ScrollArea::vertical().max_height((screen.height() - 220.0).max(120.0)).show(ui, |ui| {
+                            if groups.is_empty() {
+                                ui.label(egui::RichText::new("Tidak ada yang cocok.").color(pal.muted));
+                            }
+                            for chunk in groups.chunks(ncols) {
+                                ui.columns(ncols, |cols| {
+                                    for (col, (title, rows)) in cols.iter_mut().zip(chunk) {
+                                        col.spacing_mut().item_spacing.y = SP_1;
+                                        col.label(
+                                            egui::RichText::new(title.to_uppercase()).size(TEXT_SMALL).strong().color(pal.accent),
+                                        );
+                                        col.add_space(2.0);
+                                        for (label, keys) in rows {
+                                            col.allocate_ui_with_layout(
+                                                vec2(col.available_width(), 26.0),
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    kbd(ui, &pal, keys);
+                                                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                                        ui.add(egui::Label::new(label.as_str()).truncate());
+                                                    });
+                                                },
+                                            );
+                                        }
+                                    }
+                                });
+                                ui.add_space(SP_3);
                             }
                         });
-                        ui.add_space(6.0);
-                    }
-                    ui.heading("Gestur tetap");
-                    egui::Grid::new("cs-fixed").num_columns(2).striped(true).show(ui, |ui| {
-                        for (k, v) in FIXED_GESTURES {
-                            ui.label(*k);
-                            ui.label(*v);
-                            ui.end_row();
+                        if !gestures.is_empty() {
+                            ui.add_space(SP_2);
+                            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+                            ui.painter().rect_filled(rect, 0.0, pal.line);
+                            ui.add_space(14.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = vec2(20.0, 6.0);
+                                for (k, v) in gestures {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 0.0;
+                                        ui.label(egui::RichText::new(*k).size(TEXT_SMALL).strong().color(pal.text));
+                                        ui.label(egui::RichText::new(*v).size(TEXT_SMALL).color(pal.muted));
+                                    });
+                                }
+                            });
                         }
                     });
-                    ui.add_space(6.0);
-                    ui.weak("Ubah di Settings > Shortcut atau [editor.shortcuts] di config.toml.");
-                });
             });
-        if !open {
+        self.help_query = query_edit;
+        if open_settings {
+            self.open_settings();
+        }
+        let outside = scrim_clicked
+            && ctx.input(|i| i.pointer.interact_pos()).is_none_or(|p| !dialog.response.rect.contains(p));
+        if close || outside {
             self.show_help = false;
         }
     }
@@ -663,12 +1037,13 @@ impl EditorApp {
     // ---- canvas ----------------------------------------------------------
 
     fn canvas(&mut self, ctx: &Context) {
+        let pal = self.pal;
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(Color32::from_gray(38)))
+            .frame(egui::Frame::none().fill(pal.canvas))
             .show(ctx, |ui| {
                 if let Some(e) = &self.load_err {
                     ui.centered_and_justified(|ui| {
-                        ui.colored_label(Color32::LIGHT_RED, format!("Cannot open image: {e}"));
+                        ui.colored_label(pal.danger, format!("Cannot open image: {e}"));
                     });
                     return;
                 }
@@ -725,7 +1100,16 @@ impl EditorApp {
                     self.interact(ctx, &resp, &to_img, &base);
                 }
 
-                painter.rect_filled(img_rect, 0.0, Color32::from_gray(20));
+                painter.add(
+                    egui::epaint::Shadow {
+                        offset: vec2(0.0, 6.0),
+                        blur: 24.0,
+                        spread: 0.0,
+                        color: Color32::from_black_alpha(if pal.dark { 110 } else { 41 }),
+                    }
+                    .as_shape(img_rect, 2.0),
+                );
+                painter.rect_filled(img_rect, 0.0, pal.surface);
                 painter.image(tex.id(), img_rect, ERect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
 
                 self.effect_used.clear();
@@ -761,7 +1145,13 @@ impl EditorApp {
                     if let Some(sh) = shapes.get(*i) {
                         let (min, max) = sh.bounds();
                         let r = ERect::from_min_max(to_screen(min), to_screen(max)).expand(5.0);
-                        painter.rect_stroke(r, 2.0, Stroke::new(1.5_f32, Color32::from_rgb(60, 140, 255)));
+                        let st = Stroke::new(1.5_f32, pal.accent);
+                        let c = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
+                        painter.extend(EShape::dashed_line(&c, st, 5.0, 3.0));
+                        for h in &c[..4] {
+                            let hr = ERect::from_center_size(*h, Vec2::splat(7.0));
+                            painter.rect(hr, 0.0, Color32::WHITE, st);
+                        }
                     }
                 }
 
@@ -1074,6 +1464,58 @@ impl EditorApp {
     }
 }
 
+/// Fixed (non-remappable) gestures shown under the cheat-sheet columns.
+const GESTURES: &[(&str, &str)] = &[
+    ("Shift", " saat menggambar = lurus / kotak / lingkaran"),
+    ("Alt", " = dari tengah"),
+    ("Space", "+drag = geser kanvas"),
+    ("Ctrl", "+scroll = zoom"),
+    ("Esc", " batal dulu, baru tutup"),
+];
+
+/// Full-width outlined row button: label left, shortcut right (design:
+/// "Objek terpilih" actions). Local because `widgets::button` is content-sized.
+fn list_button(ui: &mut egui::Ui, pal: &Palette, label: &str, shortcut: &str, enabled: bool) -> egui::Response {
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), CONTROL_H), sense);
+    let fill = if enabled && resp.hovered() { pal.raised } else { Color32::TRANSPARENT };
+    let (fg, sc) = if enabled { (pal.text, pal.muted) } else { (pal.muted, pal.line_strong) };
+    let p = ui.painter();
+    p.rect(rect, RADIUS_CONTROL, fill, Stroke::new(1.0_f32, pal.line));
+    p.text(pos2(rect.left() + 10.0, rect.center().y), Align2::LEFT_CENTER, label, FontId::proportional(TEXT_BODY), fg);
+    if !shortcut.is_empty() {
+        p.text(pos2(rect.right() - 10.0, rect.center().y), Align2::RIGHT_CENTER, shortcut, FontId::monospace(10.0), sc);
+    }
+    resp
+}
+
+/// Thin accent slider (4 px rail, 16 px knob) over `MIN_WIDTH..=MAX_WIDTH`.
+/// Returns true when the value changed.
+fn width_slider(ui: &mut egui::Ui, pal: &Palette, value: &mut f32) -> bool {
+    use crate::session::{MAX_WIDTH, MIN_WIDTH};
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 16.0), Sense::click_and_drag());
+    let (l, r) = (rect.left() + 8.0, rect.right() - 8.0);
+    let mut changed = false;
+    if let Some(p) = resp.interact_pointer_pos() {
+        if resp.dragged() || resp.clicked() {
+            let t = ((p.x - l) / (r - l).max(1.0)).clamp(0.0, 1.0);
+            let v = MIN_WIDTH + t * (MAX_WIDTH - MIN_WIDTH);
+            if (v - *value).abs() > f32::EPSILON {
+                *value = v;
+                changed = true;
+            }
+        }
+    }
+    let t = ((*value - MIN_WIDTH) / (MAX_WIDTH - MIN_WIDTH)).clamp(0.0, 1.0);
+    let x = l + t * (r - l);
+    let y = rect.center().y;
+    let p = ui.painter();
+    p.rect_filled(ERect::from_min_max(pos2(l, y - 2.0), pos2(r, y + 2.0)), 2.0, pal.line);
+    p.rect_filled(ERect::from_min_max(pos2(l, y - 2.0), pos2(x, y + 2.0)), 2.0, pal.accent);
+    p.circle(pos2(x, y), 8.0, pal.surface, Stroke::new(2.0_f32, pal.accent));
+    changed
+}
+
 fn make_texture(ctx: &Context, img: &Image) -> TextureHandle {
     let max = ctx.input(|i| i.max_texture_side).max(512);
     let name = "jepret-image";
@@ -1102,7 +1544,7 @@ impl eframe::App for EditorApp {
 
         // Buttons/sliders must not keep keyboard focus: Enter/Space/arrows
         // belong to the shortcut map (except while typing text).
-        if self.text_edit.is_none() {
+        if self.text_edit.is_none() && !self.show_help {
             if let Some(id) = ctx.memory(|m| m.focused()) {
                 ctx.memory_mut(|m| m.surrender_focus(id));
             }
@@ -1141,7 +1583,15 @@ pub fn run(path: PathBuf, config: Config) -> jepret_core::Result<()> {
             .with_title("Jepret Editor"),
         ..Default::default()
     };
-    let app = EditorApp::new(path, config);
-    eframe::run_native("Jepret Editor", options, Box::new(move |_cc| Ok(Box::new(app))))
+    let theme = config.general.theme;
+    let mut app = EditorApp::new(path, config);
+    eframe::run_native(
+        "Jepret Editor",
+        options,
+        Box::new(move |cc| {
+            app.pal = jepret_ui_theme::install(&cc.egui_ctx, theme);
+            Ok(Box::new(app))
+        }),
+    )
         .map_err(|e| anyhow::anyhow!("editor window failed: {e}"))
 }
