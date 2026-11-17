@@ -23,6 +23,7 @@ pub mod snap;
 
 mod border;
 mod overlay;
+mod style;
 
 pub use border::RegionBorder;
 
