@@ -1,0 +1,12 @@
+[package]
+name = "jepret-editor"
+description = "Simple annotation image editor (egui)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+jepret-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+# T06: eframe, egui, image, arboard

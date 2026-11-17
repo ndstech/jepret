@@ -1,0 +1,12 @@
+[package]
+name = "jepret-settings"
+description = "Settings UI (egui) editing config.toml"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+jepret-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+# T11: eframe, egui

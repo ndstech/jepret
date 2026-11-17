@@ -1,0 +1,13 @@
+[package]
+name = "jepret-scroll"
+description = "Scrolling capture: frame stitching + scroll driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+jepret-core.workspace = true
+jepret-capture.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+# T08 (driver): windows = { workspace = true, features = [Win32_UI_Input_KeyboardAndMouse, ...] }

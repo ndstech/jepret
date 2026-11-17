@@ -1,0 +1,12 @@
+[package]
+name = "jepret-recorder"
+description = "Screen + audio recording to MP4 (WGC + Media Foundation + WASAPI)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+jepret-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+# T09: windows = { workspace = true, features = [Media_MediaFoundation, Win32_Media_Audio, Graphics_Capture, ...] }

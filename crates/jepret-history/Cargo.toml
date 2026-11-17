@@ -1,0 +1,12 @@
+[package]
+name = "jepret-history"
+description = "Capture history index (SQLite), thumbnails, auto cleanup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+jepret-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+# T05: rusqlite, image, trash

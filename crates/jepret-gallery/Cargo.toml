@@ -1,0 +1,13 @@
+[package]
+name = "jepret-gallery"
+description = "History gallery UI (egui)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+jepret-core.workspace = true
+jepret-history.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+# T10: eframe, egui, image

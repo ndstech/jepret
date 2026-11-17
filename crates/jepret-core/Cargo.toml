@@ -1,0 +1,11 @@
+[package]
+name = "jepret-core"
+description = "Shared types, config, state and templating for Jepret"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+toml.workspace = true

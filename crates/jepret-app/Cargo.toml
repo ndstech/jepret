@@ -1,0 +1,25 @@
+[package]
+name = "jepret-app"
+description = "Jepret — lightweight screen capture for Windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "jepret"
+path = "src/main.rs"
+
+[dependencies]
+jepret-core.workspace = true
+jepret-capture.workspace = true
+jepret-overlay.workspace = true
+jepret-workflow.workspace = true
+jepret-history.workspace = true
+jepret-recorder.workspace = true
+jepret-scroll.workspace = true
+jepret-editor.workspace = true
+jepret-gallery.workspace = true
+jepret-settings.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+# T12: global-hotkey, tray-icon, tracing-subscriber, tracing-appender, windows

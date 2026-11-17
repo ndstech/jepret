@@ -1,0 +1,12 @@
+[package]
+name = "jepret-workflow"
+description = "After-capture action pipeline (save, clipboard, open_with, ...)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+jepret-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+# T04: image, arboard, chrono, windows (toast, ShellExecute, SHOpenFolderAndSelectItems)
