@@ -40,15 +40,16 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-    LoadCursorW, PostQuitMessage, RegisterClassExW, SetForegroundWindow,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageTime, GetMessageW, GetWindowLongPtrW,
+    LoadCursorW, PostQuitMessage, RegisterClassExW, SetCursorPos, SetForegroundWindow,
     SetWindowLongPtrW, ShowWindow, TranslateMessage, CREATESTRUCTW, CS_DBLCLKS, CS_OWNDC, GWLP_USERDATA, IDC_CROSS, MSG,
-    SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WNDCLASSEXW, WS_EX_TOOLWINDOW,
+    SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP,
 };
 
-use crate::controller::{hex_color, Controller, Key, Mods, Outcome, HINT_ROWS};
+use crate::accel::KeyAccel;
+use crate::controller::{hex_color, hint_rows, Controller, KbMode, Key, Mods, Outcome};
 use crate::magnifier;
 use crate::style;
 use crate::OverlayOptions;
@@ -95,6 +96,8 @@ struct State {
     /// while the window is being destroyed) must not overwrite it.
     finished: bool,
     result: Option<Rect>,
+    /// Hold-to-accelerate state for the arrow keys (driven by key messages only).
+    accel: KeyAccel,
 }
 
 /// Restores the thread DPI awareness on drop.
@@ -185,6 +188,7 @@ pub(crate) fn run(
         activated: false,
         finished: false,
         result: None,
+        accel: KeyAccel::new(),
     });
 
     // SAFETY: `state` outlives the window (we pump messages until it is
@@ -348,6 +352,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             st.apply(o);
             LRESULT(0)
         }
+        WM_KEYUP | WM_SYSKEYUP => {
+            if let Some(k) = arrow_key(wp.0 as u16) {
+                st.accel.key_up(k);
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
             let key = match wp.0 as u16 {
                 x if x == VK_LEFT.0 => Some(Key::Left),
@@ -363,6 +374,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 0x4D => Some(Key::Magnifier), // M
                 0x43 => Some(Key::CopyColor), // C
                 0x48 => Some(Key::HintBar),   // H
+                0x52 => Some(Key::Anchor),    // R
                 _ => None,
             };
             match key {
@@ -372,11 +384,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         ctrl: GetKeyState(VK_CONTROL.0 as i32) < 0,
                     };
                     // Letter shortcuts are plain keys; leave Ctrl+letter to the system.
-                    let is_letter = matches!(k, Key::Monitor | Key::All | Key::Magnifier | Key::CopyColor | Key::HintBar);
+                    let is_letter = matches!(k, Key::Monitor | Key::All | Key::Magnifier | Key::CopyColor | Key::HintBar | Key::Anchor);
                     if is_letter && mods.ctrl {
                         return DefWindowProcW(hwnd, msg, wp, lp);
                     }
-                    let o = st.ctl.key(k, mods);
+                    let o = if arrow_key(wp.0 as u16).is_some() {
+                        // lParam bit 30 = key was already down (auto-repeat);
+                        // GetMessageTime = when Windows queued this message.
+                        let repeat = (lp.0 >> 30) & 1 == 1;
+                        // SAFETY: plain Win32 call without pointers.
+                        let time = unsafe { GetMessageTime() } as u32;
+                        let step = st.accel.step(k, repeat, time, mods);
+                        if step == 0 {
+                            return LRESULT(0);
+                        }
+                        st.ctl.key_step(k, mods, step)
+                    } else {
+                        st.ctl.key(k, mods)
+                    };
                     st.apply(o);
                     LRESULT(0)
                 }
@@ -403,6 +428,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     }
 }
 
+/// Arrow keys (the only ones that accelerate).
+fn arrow_key(vk: u16) -> Option<Key> {
+    match vk {
+        x if x == VK_LEFT.0 => Some(Key::Left),
+        x if x == VK_RIGHT.0 => Some(Key::Right),
+        x if x == VK_UP.0 => Some(Key::Up),
+        x if x == VK_DOWN.0 => Some(Key::Down),
+        _ => None,
+    }
+}
+
 impl State {
     /// Client-area lParam -> virtual-desktop point.
     fn desktop_point(&self, lp: LPARAM) -> Point {
@@ -417,6 +453,13 @@ impl State {
             match o {
                 Outcome::Idle => {}
                 Outcome::Redraw => {
+                    let _ = InvalidateRect(self.hwnd, None, false);
+                }
+                Outcome::MoveCursor(p) => {
+                    // SAFETY: plain Win32 call; coordinates are virtual-desktop px.
+                    if let Err(e) = SetCursorPos(p.x, p.y) {
+                        warn!("overlay: SetCursorPos({}, {}) failed: {e}", p.x, p.y);
+                    }
                     let _ = InvalidateRect(self.hwnd, None, false);
                 }
                 Outcome::CopyColor(p) => {
@@ -544,8 +587,12 @@ unsafe fn draw_scene(
         g.rt.FillRoundedRectangle(&rr(D2D_RECT_F { left: x, top: y, right: x + pw, bottom: y + ph }, 6.0), &g.brush);
         g.text(&g.fonts.mono_b, &text, x + 10.0, y + 4.0, &style::WHITE);
 
-        if hover {
-            let label = "Tab \u{b7} snap ke window ini";
+        let kb_label = ctl.kb_mode().map(|m| match m {
+            KbMode::Extend => "Mode: perluas \u{b7} Tab: geser",
+            KbMode::Move => "Mode: geser \u{b7} Tab: perluas",
+        });
+        if hover || kb_label.is_some() {
+            let label = kb_label.unwrap_or("Tab \u{b7} snap ke window ini");
             let (lw, lh) = g.measure(&g.fonts.ui, label);
             let (bw, bh) = (lw + 16.0, lh + 6.0);
             let bx = (x + pw + 8.0).min((full.right - bw).max(0.0));
@@ -556,6 +603,17 @@ unsafe fn draw_scene(
                 &g.brush,
             );
             g.text(&g.fonts.ui, label, bx + 8.0, by + 3.0, &style::TEXT);
+        }
+    }
+
+    if let Some(a) = ctl.anchor() {
+        // Anchor marker: small crosshair on the anchor pixel.
+        let ar = rect_f(Rect::new(a.x, a.y, 1, 1), origin);
+        let (ax, ay) = ((ar.left + ar.right) / 2.0, (ar.top + ar.bottom) / 2.0);
+        for (c, w) in [(&style::WHITE, 4.0), (&style::ACCENT, 2.0)] {
+            g.brush.SetColor(c);
+            g.rt.DrawLine(D2D_POINT_2F { x: ax - 8.0, y: ay }, D2D_POINT_2F { x: ax + 8.0, y: ay }, &g.brush, w, None);
+            g.rt.DrawLine(D2D_POINT_2F { x: ax, y: ay - 8.0 }, D2D_POINT_2F { x: ax, y: ay + 8.0 }, &g.brush, w, None);
         }
     }
 
@@ -576,7 +634,7 @@ unsafe fn draw_scene(
         top += bh + 6.0;
     }
     if ctl.hint_bar_on() {
-        draw_hint_bar(g, cx, (mon.y - origin.y) as f32 + mon.height as f32 - 28.0);
+        draw_hint_bar(g, hint_rows(ctl.stage()), cx, (mon.y - origin.y) as f32 + mon.height as f32 - 28.0);
     }
 
     if ctl.magnifier_on() {
@@ -590,11 +648,11 @@ unsafe fn draw_scene(
 /// (key, description, key width, key height, description width).
 type HintItem<'a> = (&'a str, &'a str, f32, f32, f32);
 
-unsafe fn draw_hint_bar(g: &Gfx, cx: f32, bottom: f32) {
+unsafe fn draw_hint_bar(g: &Gfx, hint: &[&[(&str, &str)]; 2], cx: f32, bottom: f32) {
     const GAP_ITEM: f32 = 16.0;
     const GAP_KBD: f32 = 6.0;
     // Pre-measure: (kbd text w, kbd text h, desc w, desc h) per item.
-    let rows: Vec<Vec<HintItem>> = HINT_ROWS
+    let rows: Vec<Vec<HintItem>> = hint
         .iter()
         .map(|row| {
             row.iter()

@@ -13,9 +13,12 @@
 //!
 //! Interaction summary: drag selects (pixel-inclusive, release confirms);
 //! click without drag picks the hovered window (needs `window_rects`);
-//! arrows nudge 1 px, Shift+arrows resize the bottom-right edge; Enter
+//! arrows move the cursor (no selection yet) or nudge the selection (Ctrl+
+//! arrows resize it); `R` starts a keyboard selection (anchor + arrows, Tab =
+//! extend/move, see [`controller`]; hold-to-accelerate in [`accel`]); Enter
 //! confirms; Esc / right click cancel; losing focus cancels.
 
+pub mod accel;
 pub mod controller;
 pub mod magnifier;
 pub mod selection;

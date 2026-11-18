@@ -116,6 +116,16 @@ impl Selection {
         }
     }
 
+    /// Keyboard variant of a drag: select the inclusive rect between `anchor`
+    /// and `corner` (both clamped), flipping naturally when they cross. No
+    /// click threshold. Returns true when the rect changed.
+    pub fn set_span(&mut self, anchor: Point, corner: Point) -> bool {
+        let r = inclusive_rect(self.clamp_point(anchor), self.clamp_point(corner));
+        let changed = self.rect != Some(r);
+        self.rect = Some(r);
+        changed
+    }
+
     /// Move the selection by (dx, dy), staying inside bounds. Size is kept.
     pub fn nudge(&mut self, dx: i32, dy: i32) -> bool {
         let Some(r) = self.rect else { return false };
@@ -146,6 +156,17 @@ mod tests {
     use super::*;
 
     const B: Rect = Rect::new(-1920, 0, 4480, 1440);
+
+    #[test]
+    fn span_is_inclusive_and_flips() {
+        let mut s = Selection::new(B, None);
+        let a = Point::new(100, 100);
+        assert!(s.set_span(a, a));
+        assert_eq!(s.rect(), Some(Rect::new(100, 100, 1, 1)));
+        s.set_span(a, Point::new(90, 120));
+        assert_eq!(s.rect(), Some(Rect::new(90, 100, 11, 21)));
+        assert!(!s.set_span(a, Point::new(90, 120)));
+    }
 
     #[test]
     fn drag_is_pixel_inclusive_any_direction() {
