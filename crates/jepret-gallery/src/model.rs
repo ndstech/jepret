@@ -78,6 +78,141 @@ impl Filter {
     }
 }
 
+// ------------------------------------------------- Sidebar filter mapping
+
+/// "Koleksi" rows of the filter panel (mutually exclusive).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Collection {
+    All,
+    Favorites,
+    Images,
+    Videos,
+}
+
+/// "Tanggal" presets of the filter panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatePreset {
+    Today,
+    Yesterday,
+    /// Today and the six days before it.
+    Last7,
+}
+
+impl DatePreset {
+    /// `(from, to)` as typed into [`Filter`] (`YYYY-MM-DD`, empty = open).
+    pub fn range(self, today: NaiveDate) -> (String, String) {
+        let fmt = |d: NaiveDate| d.format("%Y-%m-%d").to_string();
+        match self {
+            DatePreset::Today => (fmt(today), fmt(today)),
+            DatePreset::Yesterday => {
+                let y = today.pred_opt().unwrap_or(today);
+                (fmt(y), fmt(y))
+            }
+            DatePreset::Last7 => (fmt(today - chrono::Duration::days(6)), String::new()),
+        }
+    }
+}
+
+impl Filter {
+    pub fn collection(&self) -> Collection {
+        if self.favorites_only {
+            return Collection::Favorites;
+        }
+        match self.kind {
+            KindFilter::All => Collection::All,
+            KindFilter::Image => Collection::Images,
+            KindFilter::Video => Collection::Videos,
+        }
+    }
+
+    pub fn set_collection(&mut self, c: Collection) {
+        self.favorites_only = c == Collection::Favorites;
+        self.kind = match c {
+            Collection::Images => KindFilter::Image,
+            Collection::Videos => KindFilter::Video,
+            Collection::All | Collection::Favorites => KindFilter::All,
+        };
+    }
+
+    /// Preset matching the current date fields exactly, if any.
+    pub fn date_preset(&self, today: NaiveDate) -> Option<DatePreset> {
+        let cur = (self.from.trim(), self.to.trim());
+        [DatePreset::Today, DatePreset::Yesterday, DatePreset::Last7].into_iter().find(|p| {
+            let (f, t) = p.range(today);
+            (f.as_str(), t.as_str()) == cur
+        })
+    }
+
+    pub fn set_date_preset(&mut self, p: Option<DatePreset>, today: NaiveDate) {
+        let (f, t) = p.map(|p| p.range(today)).unwrap_or_default();
+        self.from = f;
+        self.to = t;
+    }
+
+    /// Any date bound that is not one of the presets.
+    pub fn has_custom_date(&self, today: NaiveDate) -> bool {
+        (!self.from.trim().is_empty() || !self.to.trim().is_empty()) && self.date_preset(today).is_none()
+    }
+}
+
+/// Whole-history totals for the sidebar counts and status bar. Filled by one
+/// pass over the list; entries themselves are never kept.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Counts {
+    pub all: u64,
+    pub images: u64,
+    pub videos: u64,
+    pub favorites: u64,
+    pub today: u64,
+    pub yesterday: u64,
+    pub last7: u64,
+    pub missing: u64,
+    pub bytes: u64,
+}
+
+impl Counts {
+    pub fn add(&mut self, e: &Entry, today: NaiveDate) {
+        self.all += 1;
+        self.bytes += e.bytes;
+        self.missing += u64::from(e.missing);
+        self.favorites += u64::from(e.favorite);
+        match e.kind {
+            EntryKind::Image => self.images += 1,
+            EntryKind::Video => self.videos += 1,
+        }
+        let age = (today - local_day(e.created_at)).num_days();
+        if (0..=6).contains(&age) {
+            self.last7 += 1;
+        }
+        match age {
+            0 => self.today += 1,
+            1 => self.yesterday += 1,
+            _ => {}
+        }
+    }
+}
+
+/// Size of a `w x h` image scaled to fit inside `box_w x box_h` keeping the
+/// aspect ratio (never cropped or stretched). Unknown size fills the box.
+pub fn fit_inside(box_w: f32, box_h: f32, w: f32, h: f32) -> (f32, f32) {
+    if w <= 0.0 || h <= 0.0 || box_w <= 0.0 || box_h <= 0.0 {
+        return (box_w.max(0.0), box_h.max(0.0));
+    }
+    let k = (box_w / w).min(box_h / h);
+    (w * k, h * k)
+}
+
+/// Card width that makes `cols` cards plus gaps fill `avail` exactly.
+pub fn card_width(avail: f32, cols: usize, gap: f32) -> f32 {
+    ((avail - gap * (cols.max(1) as f32 - 1.0)) / cols.max(1) as f32).floor().max(120.0)
+}
+
+/// "18 Nov 2026".
+pub fn short_date(day: NaiveDate) -> String {
+    use chrono::Datelike;
+    format!("{} {} {}", day.day(), &MONTHS_ID[day.month0() as usize][..3], day.year())
+}
+
 // --------------------------------------------------------------------- LRU
 
 /// Small LRU cache (tick based; eviction is O(n), n is a few hundred).
@@ -672,6 +807,69 @@ mod tests {
         assert_eq!(m(7, Dir::Up), 6);
         assert_eq!(m(8, Dir::Right), 8);
         assert_eq!(m(1, Dir::Up), 1);
+    }
+
+    #[test]
+    fn collection_and_date_mapping() {
+        let today = NaiveDate::from_ymd_opt(2026, 11, 18).unwrap();
+        let mut f = Filter::default();
+        assert_eq!(f.collection(), Collection::All);
+        for c in [Collection::Favorites, Collection::Images, Collection::Videos, Collection::All] {
+            f.set_collection(c);
+            assert_eq!(f.collection(), c);
+        }
+        f.set_collection(Collection::Favorites);
+        assert!(f.favorites_only && f.kind == KindFilter::All);
+        for p in [DatePreset::Today, DatePreset::Yesterday, DatePreset::Last7] {
+            f.set_date_preset(Some(p), today);
+            assert_eq!(f.date_preset(today), Some(p));
+            assert!(!f.has_custom_date(today));
+            assert!(f.to_query().is_ok());
+        }
+        assert_eq!(DatePreset::Last7.range(today), ("2026-11-12".into(), String::new()));
+        assert_eq!(DatePreset::Yesterday.range(today).0, "2026-11-17");
+        f.from = "2026-01-01".into();
+        assert!(f.has_custom_date(today));
+        f.set_date_preset(None, today);
+        assert!(f.from.is_empty() && f.to.is_empty());
+    }
+
+    #[test]
+    fn counts_bucket_by_kind_and_age() {
+        let today = NaiveDate::from_ymd_opt(2026, 11, 18).unwrap();
+        let noon = |d: NaiveDate| {
+            Local.from_local_datetime(&d.and_hms_opt(12, 0, 0).unwrap()).earliest().unwrap().timestamp_millis()
+        };
+        let mk = |days: i64, kind, fav, missing| Entry {
+            id: 1,
+            path: "a.png".into(),
+            kind,
+            created_at: noon(today - chrono::Duration::days(days)),
+            width: 1,
+            height: 1,
+            bytes: 10,
+            source: String::new(),
+            favorite: fav,
+            missing,
+        };
+        let mut c = Counts::default();
+        c.add(&mk(0, EntryKind::Image, true, false), today);
+        c.add(&mk(1, EntryKind::Video, false, true), today);
+        c.add(&mk(6, EntryKind::Image, false, false), today);
+        c.add(&mk(30, EntryKind::Image, false, false), today);
+        assert_eq!((c.all, c.images, c.videos, c.favorites), (4, 3, 1, 1));
+        assert_eq!((c.today, c.yesterday, c.last7, c.missing, c.bytes), (1, 1, 3, 1, 40));
+    }
+
+    #[test]
+    fn fit_and_card_width() {
+        assert_eq!(fit_inside(200.0, 100.0, 400.0, 100.0), (200.0, 50.0));
+        assert_eq!(fit_inside(200.0, 100.0, 100.0, 400.0), (25.0, 100.0));
+        assert_eq!(fit_inside(200.0, 100.0, 0.0, 0.0), (200.0, 100.0));
+        assert_eq!(card_width(454.0, 2, 14.0), 220.0);
+        assert_eq!(card_width(50.0, 1, 14.0), 120.0);
+        let d = NaiveDate::from_ymd_opt(2026, 11, 8).unwrap();
+        assert_eq!(short_date(d), "8 Nov 2026");
     }
 
     #[test]
