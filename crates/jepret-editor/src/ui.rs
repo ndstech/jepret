@@ -27,7 +27,7 @@ use jepret_core::{Config, Image, Rect};
 use crate::doc::{Handle, HandleKind, Pt, Shape, ShapeKind, Tool};
 use crate::input::{combo_from_key, Keymap};
 use crate::session::{self, constrain_drag, DragKind, Effect, Session, ZoomCmd};
-use crate::{io, render};
+use crate::{io, render, view};
 
 type LoadResult = Result<Image, String>;
 
@@ -69,6 +69,40 @@ fn pin_callout_width(sh: &mut Shape) {
     }
 }
 
+const SCROLL_W: f32 = 8.0;
+const NAV_PAD: f32 = 6.0;
+
+/// Where the scrollbars and navigator go this frame (screen points).
+struct Overlays {
+    view: ERect,
+    h_track: Option<ERect>,
+    v_track: Option<ERect>,
+    nav_img: Option<ERect>,
+}
+
+impl Overlays {
+    fn layout(view: ERect, iw: f32, ih: f32, zoom: f32) -> Self {
+        let sx = view::scrollable(view.width(), iw * zoom);
+        let sy = view::scrollable(view.height(), ih * zoom);
+        let m = 3.0;
+        let h_track = sx.then(|| {
+            let right = view.max.x - m - if sy { SCROLL_W + m } else { 0.0 };
+            ERect::from_min_max(pos2(view.min.x + m, view.max.y - m - SCROLL_W), pos2(right, view.max.y - m))
+        });
+        let v_track = sy.then(|| {
+            let bottom = view.max.y - m - if sx { SCROLL_W + m } else { 0.0 };
+            ERect::from_min_max(pos2(view.max.x - m - SCROLL_W, view.min.y + m), pos2(view.max.x - m, bottom))
+        });
+        let (nw, nh) = view::navigator_size(iw, ih, 200.0, 140.0);
+        let room = view.width() > nw * 2.5 && view.height() > nh * 2.0;
+        let nav_img = ((sx || sy) && room && nw > 0.0).then(|| {
+            let inset = 12.0 + NAV_PAD + SCROLL_W + m;
+            ERect::from_min_size(pos2(view.max.x - inset - nw, view.max.y - inset - nh), vec2(nw, nh))
+        });
+        Self { view, h_track, v_track, nav_img }
+    }
+}
+
 fn handle_cursor(k: HandleKind) -> egui::CursorIcon {
     use egui::CursorIcon as C;
     match k {
@@ -105,6 +139,10 @@ pub struct EditorApp {
     pan: Vec2,
     fit_pending: bool,
     canvas_rect: ERect,
+    /// Pointer offset inside a scrollbar thumb while it is dragged.
+    scroll_grab: f32,
+    /// Crop before the current Crop-tool session (Esc restores it).
+    crop_before: Option<Option<Rect>>,
 
     text_edit: Option<TextEdit>,
     confirm_close: bool,
@@ -156,6 +194,8 @@ impl EditorApp {
             pan: Vec2::ZERO,
             fit_pending: true,
             canvas_rect: ERect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0)),
+            scroll_grab: 0.0,
+            crop_before: None,
             text_edit: None,
             confirm_close: false,
             force_close: false,
@@ -496,6 +536,23 @@ impl EditorApp {
                 }
             }
         }
+        // Crop tool owns Enter (apply) / Esc (cancel) so they don't close the editor.
+        if self.s.tool == Tool::Crop && self.drawing.is_none() && !self.confirm_close && !self.show_help {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
+                self.crop_before = None;
+                self.s.set_tool(Tool::Select);
+                self.status = "Crop diterapkan".into();
+            } else if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                if let Some(prev) = self.crop_before.take() {
+                    self.s.doc.set_crop(prev);
+                }
+                self.s.set_tool(Tool::Select);
+                self.status = "Crop dibatalkan".into();
+            }
+        }
+        if self.s.tool != Tool::Crop {
+            self.crop_before = None;
+        }
         let events = ctx.input(|i| i.events.clone());
         let mods = ctx.input(|i| i.modifiers);
         let mut combos: Vec<(KeyCombo, bool)> = Vec::new();
@@ -676,6 +733,7 @@ impl EditorApp {
                 "{name} · klik titik-titik, klik titik awal/Enter = selesai, Backspace = hapus titik, Esc = batal"
             ),
             Tool::Callout => format!("{name} · drag dari titik yang ditunjuk ke posisi balon"),
+            Tool::Crop => format!("{name} · drag area, Enter = terapkan, Esc = batal"),
             _ => name.to_string(),
         }
     }
@@ -1232,11 +1290,21 @@ impl EditorApp {
                         self.pan += sd;
                     }
                 }
-                let space = ui.input(|i| i.key_down(Key::Space));
+                // Space (unless typing) turns the pointer into a hand, like Photoshop.
+                let space = ui.input(|i| i.key_down(Key::Space)) && !ctx.wants_keyboard_input();
                 let panning = resp.dragged_by(PointerButton::Middle) || (space && resp.dragged_by(PointerButton::Primary));
                 if panning {
                     self.pan += resp.drag_delta();
+                    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                } else if space && resp.hovered() {
+                    ctx.set_cursor_icon(egui::CursorIcon::Grab);
                 }
+
+                // Scrollbars + navigator appear once the image outgrows the view.
+                let ov = Overlays::layout(rect, iw, ih, self.zoom);
+                let over_overlay = self.overlay_input(ui, &ov, iw, ih);
+                let (cw, ch) = (iw * self.zoom, ih * self.zoom);
+                self.pan = vec2(view::clamp_pan(self.pan.x, rect.width(), cw), view::clamp_pan(self.pan.y, rect.height(), ch));
 
                 let zoom = self.zoom;
                 let origin = rect.min + self.pan;
@@ -1244,7 +1312,7 @@ impl EditorApp {
                 let to_img = |p: Pos2| Pt::new((p.x - origin.x) / zoom, (p.y - origin.y) / zoom);
                 let img_rect = ERect::from_min_size(origin, vec2(iw * zoom, ih * zoom));
 
-                if !panning && !space {
+                if !panning && !space && !over_overlay {
                     self.interact(ctx, &resp, &to_img, &base);
                 }
 
@@ -1341,10 +1409,95 @@ impl EditorApp {
                     }
                 }
 
+                self.paint_overlays(&painter, &ov, &tex, iw, ih);
+
                 if self.text_edit.is_some() {
                     self.text_overlay(ctx, &to_screen, zoom);
                 }
             });
+    }
+
+    /// Scrollbar / navigator interaction; returns true while the pointer
+    /// is on (or dragging) one of them so the canvas tools stay idle.
+    fn overlay_input(&mut self, ui: &egui::Ui, ov: &Overlays, iw: f32, ih: f32) -> bool {
+        let view = ov.view;
+        let zoom = self.zoom;
+        let mut busy = false;
+        for (axis, track) in [(0usize, ov.h_track), (1, ov.v_track)] {
+            let Some(track) = track else { continue };
+            let r = ui.interact(track, egui::Id::new(("jepret_scroll", axis)), Sense::click_and_drag());
+            busy |= r.hovered() || r.dragged();
+            let (t0, tl, vlen, clen, pan) = if axis == 0 {
+                (track.min.x, track.width(), view.width(), iw * zoom, self.pan.x)
+            } else {
+                (track.min.y, track.height(), view.height(), ih * zoom, self.pan.y)
+            };
+            let Some(p) = r.interact_pointer_pos() else { continue };
+            let at = if axis == 0 { p.x } else { p.y } - t0;
+            let (start, len) = view::thumb(tl, vlen, clen, pan);
+            if r.drag_started() || r.clicked() {
+                // Grab the thumb where it was hit; a track click centres it.
+                self.scroll_grab = if (start..=start + len).contains(&at) { at - start } else { len / 2.0 };
+            }
+            if r.dragged() || r.clicked() || r.drag_started() {
+                let np = view::pan_for_thumb(tl, vlen, clen, at - self.scroll_grab);
+                if axis == 0 {
+                    self.pan.x = np;
+                } else {
+                    self.pan.y = np;
+                }
+            }
+        }
+        if let Some(nav) = ov.nav_img {
+            let r = ui.interact(nav.expand(NAV_PAD), egui::Id::new("jepret_navigator"), Sense::click_and_drag());
+            busy |= r.hovered() || r.dragged();
+            if r.hovered() || r.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+            }
+            if r.dragged() || r.clicked() || r.drag_started() {
+                if let Some(p) = r.interact_pointer_pos() {
+                    let fx = ((p.x - nav.min.x) / nav.width()).clamp(0.0, 1.0);
+                    let fy = ((p.y - nav.min.y) / nav.height()).clamp(0.0, 1.0);
+                    self.pan = vec2(
+                        view::pan_centering(fx * iw, view.width(), zoom),
+                        view::pan_centering(fy * ih, view.height(), zoom),
+                    );
+                }
+            }
+        }
+        busy
+    }
+
+    fn paint_overlays(&self, painter: &egui::Painter, ov: &Overlays, tex: &TextureHandle, iw: f32, ih: f32) {
+        let pal = self.pal;
+        let view = ov.view;
+        let (cw, ch) = (iw * self.zoom, ih * self.zoom);
+        let track_c = Color32::from_black_alpha(if pal.dark { 70 } else { 22 });
+        let thumb_c = if pal.dark { Color32::from_white_alpha(110) } else { Color32::from_black_alpha(100) };
+        if let Some(t) = ov.h_track {
+            painter.rect_filled(t, SCROLL_W / 2.0, track_c);
+            let (s, l) = view::thumb(t.width(), view.width(), cw, self.pan.x);
+            painter.rect_filled(ERect::from_min_size(pos2(t.min.x + s, t.min.y), vec2(l, t.height())), SCROLL_W / 2.0, thumb_c);
+        }
+        if let Some(t) = ov.v_track {
+            painter.rect_filled(t, SCROLL_W / 2.0, track_c);
+            let (s, l) = view::thumb(t.height(), view.height(), ch, self.pan.y);
+            painter.rect_filled(ERect::from_min_size(pos2(t.min.x, t.min.y + s), vec2(t.width(), l)), SCROLL_W / 2.0, thumb_c);
+        }
+        if let Some(nav) = ov.nav_img {
+            let frame = nav.expand(NAV_PAD);
+            painter.add(
+                egui::epaint::Shadow { offset: vec2(0.0, 4.0), blur: 16.0, spread: 0.0, color: Color32::from_black_alpha(60) }
+                    .as_shape(frame, RADIUS_PANEL),
+            );
+            painter.rect(frame, RADIUS_PANEL, pal.raised, Stroke::new(1.0_f32, pal.line));
+            painter.image(tex.id(), nav, ERect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            // Visible part of the image, in navigator space.
+            let k = nav.width() / iw.max(1.0) / self.zoom;
+            let vis = ERect::from_min_size(nav.min + (-self.pan) * k, view.size() * k).intersect(nav);
+            painter.rect_filled(vis, 0.0, Color32::from_white_alpha(28));
+            painter.rect_stroke(vis, 0.0, Stroke::new(1.5_f32, pal.accent));
+        }
     }
 
     fn paint_crop_overlay(painter: &egui::Painter, full: ERect, crop: ERect) {
@@ -1569,6 +1722,9 @@ impl EditorApp {
                 let x1 = a.x.max(b.x).round().min(base.width as f32);
                 let y1 = a.y.max(b.y).round().min(base.height as f32);
                 if x1 - x0 >= 4.0 && y1 - y0 >= 4.0 {
+                    if self.crop_before.is_none() {
+                        self.crop_before = Some(self.s.doc.crop());
+                    }
                     self.s.doc.set_crop(Some(Rect::new(x0 as i32, y0 as i32, (x1 - x0) as u32, (y1 - y0) as u32)));
                 }
             }

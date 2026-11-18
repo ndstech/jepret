@@ -13,6 +13,7 @@ pub mod io;
 pub mod render;
 pub mod input;
 pub mod session;
+mod view;
 mod ui;
 
 use std::path::Path;
