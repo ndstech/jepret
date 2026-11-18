@@ -26,7 +26,7 @@ use jepret_core::{Config, Image, Rect};
 
 use crate::doc::{Pt, Shape, ShapeKind, Tool};
 use crate::input::{combo_from_key, Keymap};
-use crate::session::{constrain_drag, DragKind, Effect, Session, ZoomCmd};
+use crate::session::{self, constrain_drag, DragKind, Effect, Session, ZoomCmd};
 use crate::{io, render};
 
 type LoadResult = Result<Image, String>;
@@ -39,6 +39,11 @@ struct TextEdit {
     editing: Option<usize>,
     focus_pending: bool,
 }
+
+/// Tool panel: 2 columns of `TOOL_BTN` buttons with symmetric padding.
+const TOOL_GAP: f32 = 3.0;
+const TOOL_PAD: f32 = 6.0;
+const PANEL_W: f32 = TOOL_BTN * 2.0 + TOOL_GAP + TOOL_PAD * 2.0;
 
 pub struct EditorApp {
     path: PathBuf,
@@ -53,6 +58,8 @@ pub struct EditorApp {
 
     s: Session,
     drawing: Option<Shape>,
+    /// Polygon tool: vertices placed so far (image px); not in the document until finished.
+    poly_draft: Option<Vec<Pt>>,
     drag_start: Pt,
     moving: bool,
     prop_editing: bool,
@@ -103,6 +110,7 @@ impl EditorApp {
             tex: None,
             s,
             drawing: None,
+            poly_draft: None,
             drag_start: Pt::default(),
             moving: false,
             prop_editing: false,
@@ -375,6 +383,15 @@ impl EditorApp {
     }
 
     /// Run a shortcut / toolbar command by catalogue id.
+    /// Turn the polygon draft into a shape (>= 3 distinct points) or drop it.
+    fn finish_polygon(&mut self) {
+        let Some(draft) = self.poly_draft.take() else { return };
+        if let Some(points) = session::finalize_polygon(&draft) {
+            let sh = self.s.new_shape(ShapeKind::Polygon { points });
+            self.s.add_and_select(sh);
+        }
+    }
+
     fn run_command(&mut self, ctx: &Context, id: &str, big: bool) {
         // Tiered "close": cancel drag -> close overlays -> deselect -> close.
         if id == "file.close" {
@@ -394,6 +411,9 @@ impl EditorApp {
         let e = self.s.dispatch(id, big);
         if self.s.tool != was {
             self.drawing = None;
+            if was == Tool::Polygon {
+                self.finish_polygon();
+            }
         }
         self.run_effect(ctx, e);
     }
@@ -407,6 +427,21 @@ impl EditorApp {
                 self.commit_text();
             }
             return;
+        }
+        // An active polygon draft owns Enter / Esc / Backspace.
+        if self.poly_draft.is_some() && !self.confirm_close && !self.show_help {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
+                self.finish_polygon();
+            } else if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                self.poly_draft = None;
+            } else if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Backspace)) {
+                if let Some(d) = self.poly_draft.as_mut() {
+                    d.pop();
+                    if d.is_empty() {
+                        self.poly_draft = None;
+                    }
+                }
+            }
         }
         let events = ctx.input(|i| i.events.clone());
         let mods = ctx.input(|i| i.modifiers);
@@ -584,6 +619,9 @@ impl EditorApp {
                 format!("{name} · Shift = proporsional · Alt = dari tengah")
             }
             Tool::TextBox => format!("{name} · drag = lebar kotak, teks membungkus"),
+            Tool::Polygon => format!(
+                "{name} · klik titik-titik, klik titik awal/Enter = selesai, Backspace = hapus titik, Esc = batal"
+            ),
             Tool::Callout => format!("{name} · drag dari titik yang ditunjuk ke posisi balon"),
             _ => name.to_string(),
         }
@@ -593,23 +631,30 @@ impl EditorApp {
         let pal = self.pal;
         let mut picked: Option<Tool> = None;
         let r = egui::SidePanel::left("tools")
-            .exact_width(56.0)
+            .exact_width(PANEL_W)
             .resizable(false)
             .frame(egui::Frame::none().fill(pal.surface).inner_margin(egui::Margin { top: 10.0, ..Default::default() }))
             .show(ctx, |ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                ui.vertical_centered(|ui| {
-                    for (t, (icon, _)) in Tool::ALL.iter().zip(Icon::TOOLS.iter()) {
-                        let hint = self.sc(t.id());
-                        let tip = Self::tool_tooltip(*t);
-                        let b = IconButton::new(*icon, &tip)
-                            .size(TOOL_BTN)
-                            .selected(self.s.tool == *t)
-                            .shortcut(hint.as_deref())
-                            .corner_key(true);
-                        if b.show(ui, &pal).clicked() {
-                            picked = Some(*t);
-                        }
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = vec2(TOOL_GAP, TOOL_GAP);
+                    let pairs: Vec<(Tool, Icon)> =
+                        Tool::ALL.iter().copied().zip(Icon::TOOLS.iter().map(|(i, _)| *i)).collect();
+                    for row in pairs.chunks(2) {
+                        ui.horizontal(|ui| {
+                            ui.add_space(TOOL_PAD);
+                            for (t, icon) in row {
+                                let hint = self.sc(t.id());
+                                let tip = Self::tool_tooltip(*t);
+                                let b = IconButton::new(*icon, &tip)
+                                    .size(TOOL_BTN)
+                                    .selected(self.s.tool == *t)
+                                    .shortcut(hint.as_deref())
+                                    .corner_key(true);
+                                if b.show(ui, &pal).clicked() {
+                                    picked = Some(*t);
+                                }
+                            }
+                        });
                     }
                 });
             });
@@ -1206,6 +1251,22 @@ impl EditorApp {
                     Self::paint_crop_overlay(&painter, img_rect, r);
                 }
 
+                if let Some(draft) = self.poly_draft.clone().filter(|d| !d.is_empty()) {
+                    let mut pts = draft.clone();
+                    if let Some(h) = ctx.input(|i| i.pointer.hover_pos()).filter(|h| rect.contains(*h)) {
+                        let q = to_img(h);
+                        let last = *draft.last().unwrap_or(&q);
+                        pts.push(if ui.input(|i| i.modifiers.shift) { session::snap_45(last, q) } else { q });
+                    }
+                    let mut sh = self.s.new_shape(ShapeKind::Pen { points: pts });
+                    sh.fill = false;
+                    self.paint_shape(ctx, &painter, &base, &sh, &to_screen, zoom, true);
+                    for (k, p) in draft.iter().enumerate() {
+                        let sp = to_screen(*p);
+                        painter.circle(sp, if k == 0 { 5.0 } else { 3.0 }, Color32::WHITE, Stroke::new(1.5_f32, pal.accent));
+                    }
+                }
+
                 for i in self.s.selection() {
                     if let Some(sh) = shapes.get(*i) {
                         let (min, max) = sh.bounds();
@@ -1271,6 +1332,25 @@ impl EditorApp {
                             self.edit_text_shape(i);
                         } else if let Some(kind) = self.text_kind_at(tool, p) {
                             self.text_edit = Some(TextEdit { kind, text: String::new(), editing: None, focus_pending: true });
+                        }
+                    }
+                    Tool::Polygon => {
+                        self.commit_text();
+                        if resp.double_clicked_by(PointerButton::Primary) {
+                            // the first click of the pair already added the vertex
+                            self.finish_polygon();
+                        } else {
+                            let radius = 8.0 / self.zoom;
+                            let draft = self.poly_draft.get_or_insert_with(Vec::new);
+                            if session::near_first_vertex(draft, p, radius) {
+                                self.finish_polygon();
+                            } else {
+                                let q = match draft.last() {
+                                    Some(last) if mods.shift => session::snap_45(*last, p),
+                                    _ => p,
+                                };
+                                draft.push(q);
+                            }
                         }
                     }
                     Tool::Step => {
@@ -1588,8 +1668,25 @@ impl EditorApp {
                 }
             }
             ShapeKind::Text { .. } | ShapeKind::TextBox { .. } | ShapeKind::Callout { .. } => {}
-            // TODO(polygon): agent P paints it.
-            ShapeKind::Polygon { .. } => {}
+            ShapeKind::Polygon { points } => {
+                let pts: Vec<Pos2> = points.iter().map(|p| to_screen(*p)).collect();
+                if pts.len() >= 3 {
+                    if s.fill {
+                        let mut mesh = egui::Mesh::default();
+                        for p in &pts {
+                            mesh.colored_vertex(*p, c);
+                        }
+                        for t in jepret_ui_theme::icons::triangulate(&pts) {
+                            mesh.add_triangle(t[0] as u32, t[1] as u32, t[2] as u32);
+                        }
+                        painter.add(EShape::mesh(mesh));
+                    } else {
+                        painter.add(EShape::closed_line(pts, stroke));
+                    }
+                } else if pts.len() == 2 {
+                    painter.line_segment([pts[0], pts[1]], stroke);
+                }
+            }
             ShapeKind::Step { center, n } => {
                 let r = s.step_radius();
                 painter.circle_filled(to_screen(*center), r * zoom, c);

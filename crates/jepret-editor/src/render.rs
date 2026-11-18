@@ -267,8 +267,18 @@ pub fn draw_shape(canvas: &mut Image, src: &Image, shape: &Shape) {
         ShapeKind::Text { .. } | ShapeKind::TextBox { .. } | ShapeKind::Callout { .. } => {
             draw_text_shape(canvas, shape, false);
         }
-        // TODO(polygon): agent P implements outline / fill.
-        ShapeKind::Polygon { .. } => {}
+        ShapeKind::Polygon { points } => {
+            if points.len() >= 3 {
+                let (min, max) = shape.bounds();
+                let bb = bbox(min, max, w / 2.0 + 2.0);
+                paint(canvas, bb, c, |x, y| {
+                    let sd = sd_polygon(Pt::new(x, y), points);
+                    if shape.fill { sd } else { sd.abs() - w / 2.0 }
+                });
+            } else if points.len() == 2 {
+                stroke_segments(canvas, &[(points[0], points[1])], c, w);
+            }
+        }
         ShapeKind::Step { center, n } => {
             let r = shape.step_radius();
             let bb = bbox(
@@ -496,7 +506,7 @@ fn sd_round_rect(x: f32, y: f32, min: Pt, max: Pt, r: f32) -> f32 {
 }
 
 /// Signed distance to a simple polygon (negative inside).
-fn sd_polygon(p: Pt, v: &[Pt]) -> f32 {
+pub(crate) fn sd_polygon(p: Pt, v: &[Pt]) -> f32 {
     let mut d = f32::MAX;
     let mut inside = false;
     let n = v.len();
@@ -774,6 +784,48 @@ mod tests {
         assert_eq!(out.pixel(45, 45), [255, 255, 255, 255]);
         assert_eq!(out.pixel(5, 5), [255, 255, 255, 255]);
         assert_eq!(out.pixel(90, 90), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn polygon_outline_fill_concave() {
+        // L shape
+        let pts = vec![
+            Pt::new(10.0, 10.0),
+            Pt::new(30.0, 10.0),
+            Pt::new(30.0, 50.0),
+            Pt::new(70.0, 50.0),
+            Pt::new(70.0, 70.0),
+            Pt::new(10.0, 70.0),
+        ];
+        let base = solid(80, 80, [255, 255, 255, 255]);
+        let red = [255, 0, 0, 255];
+        let white = [255, 255, 255, 255];
+        let mut d = Document::new();
+        d.add_shape(Shape::new(ShapeKind::Polygon { points: pts.clone() }, red, 4.0));
+        let out = flatten(&base, &d);
+        assert_eq!(out.pixel(10, 40), red); // left edge
+        assert_eq!(out.pixel(50, 69), red); // bottom edge
+        assert_eq!(out.pixel(20, 30), white); // hollow inside
+        assert_eq!(out.pixel(60, 20), white); // concave notch, outside
+        let mut d = Document::new();
+        let mut s = Shape::new(ShapeKind::Polygon { points: pts }, red, 2.0);
+        s.fill = true;
+        d.add_shape(s);
+        let out = flatten(&base, &d);
+        assert_eq!(out.pixel(20, 30), red);
+        assert_eq!(out.pixel(50, 60), red);
+        assert_eq!(out.pixel(60, 20), white);
+        assert_eq!(out.pixel(5, 5), white);
+    }
+
+    #[test]
+    fn polygon_degenerate_no_panic() {
+        let base = solid(20, 20, [255, 255, 255, 255]);
+        for pts in [vec![], vec![Pt::new(3.0, 3.0)], vec![Pt::new(3.0, 3.0), Pt::new(10.0, 10.0)]] {
+            let mut d = Document::new();
+            d.add_shape(Shape::new(ShapeKind::Polygon { points: pts }, [0, 0, 0, 255], 2.0));
+            let _ = flatten(&base, &d);
+        }
     }
 
     #[test]
