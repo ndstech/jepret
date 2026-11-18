@@ -382,7 +382,6 @@ impl EditorApp {
         }
     }
 
-    /// Run a shortcut / toolbar command by catalogue id.
     /// Turn the polygon draft into a shape (>= 3 distinct points) or drop it.
     fn finish_polygon(&mut self) {
         let Some(draft) = self.poly_draft.take() else { return };
@@ -392,6 +391,22 @@ impl EditorApp {
         }
     }
 
+    /// Polygon tool click at `p`: add a vertex, or close on the first one.
+    fn polygon_click(&mut self, p: Pt, shift: bool) {
+        let radius = 8.0 / self.zoom;
+        let draft = self.poly_draft.get_or_insert_with(Vec::new);
+        if session::near_first_vertex(draft, p, radius) {
+            self.finish_polygon();
+        } else {
+            let q = match draft.last() {
+                Some(last) if shift => session::snap_45(*last, p),
+                _ => p,
+            };
+            draft.push(q);
+        }
+    }
+
+    /// Run a shortcut / toolbar command by catalogue id.
     fn run_command(&mut self, ctx: &Context, id: &str, big: bool) {
         // Tiered "close": cancel drag -> close overlays -> deselect -> close.
         if id == "file.close" {
@@ -1315,6 +1330,13 @@ impl EditorApp {
         }
         if resp.drag_stopped_by(PointerButton::Primary) {
             self.finish_drag(base);
+            // A click that wobbled into a tiny drag still places a vertex.
+            if self.s.tool == Tool::Polygon {
+                if let Some(p) = pos {
+                    self.commit_text();
+                    self.polygon_click(p, mods.shift);
+                }
+            }
         }
         if resp.clicked_by(PointerButton::Primary) {
             if let Some(p) = pos {
@@ -1340,17 +1362,7 @@ impl EditorApp {
                             // the first click of the pair already added the vertex
                             self.finish_polygon();
                         } else {
-                            let radius = 8.0 / self.zoom;
-                            let draft = self.poly_draft.get_or_insert_with(Vec::new);
-                            if session::near_first_vertex(draft, p, radius) {
-                                self.finish_polygon();
-                            } else {
-                                let q = match draft.last() {
-                                    Some(last) if mods.shift => session::snap_45(*last, p),
-                                    _ => p,
-                                };
-                                draft.push(q);
-                            }
+                            self.polygon_click(p, mods.shift);
                         }
                     }
                     Tool::Step => {
