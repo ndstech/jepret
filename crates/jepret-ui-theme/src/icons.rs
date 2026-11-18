@@ -100,8 +100,8 @@ impl Icon {
             Icon::Ellipse => "M12 5c4.4 0 8 3.1 8 7s-3.6 7-8 7-8-3.1-8-7 3.6-7 8-7z",
             Icon::Text => "M5 7V4h14v3 M12 4v16 M9 20h6",
             Icon::Highlight => "M15 4l5 5-8 8H7v-5z M4 20h16",
-            Icon::Blur => "M12 3s6 6.5 6 11a6 6 0 0 1-12 0c0-4.5 6-11 6-11z",
-            Icon::Pixelate => "M4 4h6v6H4z M14 4h6v6h-6z M4 14h6v6H4z M14 14h6v6h-6z",
+            Icon::Blur => "M12 9a3 3 0 1 1 0 6a3 3 0 1 1 0-6z M12 3.75a1.25 1.25 0 1 1 0 2.5a1.25 1.25 0 1 1 0-2.5z M19 10.75a1.25 1.25 0 1 1 0 2.5a1.25 1.25 0 1 1 0-2.5z M12 17.75a1.25 1.25 0 1 1 0 2.5a1.25 1.25 0 1 1 0-2.5z M5 10.75a1.25 1.25 0 1 1 0 2.5a1.25 1.25 0 1 1 0-2.5z M7 7h.01 M17 7h.01 M7 17h.01 M17 17h.01",
+            Icon::Pixelate => "M5.125 5.125h1.75v1.75h-1.75z M13.125 5.125h1.75v1.75h-1.75z M9.125 9.125h1.75v1.75h-1.75z M17.125 9.125h1.75v1.75h-1.75z M5.125 13.125h1.75v1.75h-1.75z M13.125 13.125h1.75v1.75h-1.75z M9.125 17.125h1.75v1.75h-1.75z M17.125 17.125h1.75v1.75h-1.75z",
             Icon::Step => "M12 3a9 9 0 1 1 0 18a9 9 0 1 1 0-18z M10.5 9l2-1.5V16",
             Icon::Pen => "M4 20l4-1 11-11-3-3L5 16z M14 7l3 3",
             Icon::Eyedropper => "M15 3l6 6 M18 6l-9 9-4 1 1-4 9-9 M3 21l2-2",
@@ -642,7 +642,7 @@ mod tests {
 
     #[test]
     fn multiple_subpaths_and_close() {
-        let sp = parse_path(Icon::Pixelate.path()).unwrap();
+        let sp = parse_path(Icon::Gallery.path()).unwrap();
         assert_eq!(sp.len(), 4);
         assert!(sp.iter().all(|s| s.closed));
     }
