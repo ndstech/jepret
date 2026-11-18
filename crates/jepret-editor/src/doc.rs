@@ -40,11 +40,12 @@ pub enum Tool {
     Pixelate,
     Step,
     Pen,
+    Polygon,
     Eyedropper,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 15] = [
+    pub const ALL: [Tool; 16] = [
         Tool::Select,
         Tool::Crop,
         Tool::Arrow,
@@ -59,6 +60,7 @@ impl Tool {
         Tool::Pixelate,
         Tool::Step,
         Tool::Pen,
+        Tool::Polygon,
         Tool::Eyedropper,
     ];
 
@@ -78,6 +80,7 @@ impl Tool {
             Tool::Pixelate => "Pixelate",
             Tool::Step => "Step",
             Tool::Pen => "Pen",
+            Tool::Polygon => "Polygon",
             Tool::Eyedropper => "Pick color",
         }
     }
@@ -99,6 +102,7 @@ impl Tool {
             Tool::Pixelate => "tool.pixelate",
             Tool::Step => "tool.step",
             Tool::Pen => "tool.pen",
+            Tool::Polygon => "tool.polygon",
             Tool::Eyedropper => "tool.eyedropper",
         }
     }
@@ -152,6 +156,8 @@ pub enum ShapeKind {
     /// Numbered circle; radius = `width * 4`.
     Step { center: Pt, n: u32 },
     Pen { points: Vec<Pt> },
+    /// Closed polygon through `points` (>= 3); outline, or filled with `fill`.
+    Polygon { points: Vec<Pt> },
 }
 
 impl ShapeKind {
@@ -273,7 +279,7 @@ impl Shape {
                 mv(pos);
             }
             ShapeKind::Step { center, .. } => mv(center),
-            ShapeKind::Pen { points } => points.iter_mut().for_each(mv),
+            ShapeKind::Pen { points } | ShapeKind::Polygon { points } => points.iter_mut().for_each(mv),
         }
     }
 
@@ -301,7 +307,7 @@ impl Shape {
                 sc(pos);
             }
             ShapeKind::Step { center, .. } => sc(center),
-            ShapeKind::Pen { points } => points.iter_mut().for_each(sc),
+            ShapeKind::Pen { points } | ShapeKind::Polygon { points } => points.iter_mut().for_each(sc),
         }
         self.width *= k;
     }
@@ -338,7 +344,7 @@ impl Shape {
                 let r = self.step_radius();
                 (Pt::new(center.x - r, center.y - r), Pt::new(center.x + r, center.y + r))
             }
-            ShapeKind::Pen { points } => {
+            ShapeKind::Pen { points } | ShapeKind::Polygon { points } => {
                 let mut min = Pt::new(f32::MAX, f32::MAX);
                 let mut max = Pt::new(f32::MIN, f32::MIN);
                 for p in points {
@@ -401,6 +407,8 @@ impl Shape {
                 in_bubble || seg_dist(p, *tip, c) <= self.text_px() * 0.4 + tol
             }
             ShapeKind::Step { center, .. } => center.dist(p) <= self.step_radius() + tol,
+            // TODO(polygon): agent P implements edge/inside hit test.
+            ShapeKind::Polygon { .. } => false,
             ShapeKind::Pen { points } => {
                 if points.len() == 1 {
                     return points[0].dist(p) <= half;

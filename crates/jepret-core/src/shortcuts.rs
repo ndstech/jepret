@@ -55,6 +55,7 @@ pub const EDITOR_SHORTCUTS: &[ShortcutDef] = &[
     d("tool.pixelate", "Pixelate", "Tool", &["x"]),
     d("tool.step", "Nomor urut", "Tool", &["n"]),
     d("tool.pen", "Pen bebas", "Tool", &["p"]),
+    d("tool.polygon", "Polygon", "Tool", &["g"]),
     d("tool.eyedropper", "Ambil warna", "Tool", &["i"]),
     // ---- style ----
     d("style.color_1", "Warna 1", "Gaya", &["1"]),

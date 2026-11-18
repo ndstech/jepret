@@ -1588,6 +1588,8 @@ impl EditorApp {
                 }
             }
             ShapeKind::Text { .. } | ShapeKind::TextBox { .. } | ShapeKind::Callout { .. } => {}
+            // TODO(polygon): agent P paints it.
+            ShapeKind::Polygon { .. } => {}
             ShapeKind::Step { center, n } => {
                 let r = s.step_radius();
                 painter.circle_filled(to_screen(*center), r * zoom, c);

@@ -267,6 +267,8 @@ pub fn draw_shape(canvas: &mut Image, src: &Image, shape: &Shape) {
         ShapeKind::Text { .. } | ShapeKind::TextBox { .. } | ShapeKind::Callout { .. } => {
             draw_text_shape(canvas, shape, false);
         }
+        // TODO(polygon): agent P implements outline / fill.
+        ShapeKind::Polygon { .. } => {}
         ShapeKind::Step { center, n } => {
             let r = shape.step_radius();
             let bb = bbox(
