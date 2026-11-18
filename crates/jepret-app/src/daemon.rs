@@ -52,7 +52,8 @@ use windows::{
             LibraryLoader::GetModuleHandleW,
             Registry::{
                 RegCloseKey, RegDeleteValueW, RegGetValueW, RegOpenKeyExW, RegSetValueExW, HKEY,
-                HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ, RRF_RT_REG_DWORD,
+                HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_SET_VALUE, REG_SZ, RRF_RT_REG_DWORD,
+                RRF_RT_REG_SZ,
             },
             Threading::{CreateMutexW, INFINITE},
         },
@@ -948,7 +949,9 @@ fn shortcut_label(config: &Config, kind: CaptureKind) -> Option<String> {
         .map(|k| k.pretty())
 }
 
-/// Windows 11 binds PrtSc to Snipping Tool when this per-user DWORD is 1.
+/// Windows binds PrtSc to Snipping Tool when this per-user DWORD is 1. On
+/// Windows 11 the value is absent until the user touches the setting, and
+/// the absent default is *on*.
 fn print_screen_opens_snipping_tool() -> bool {
     let mut data = 0u32;
     let mut size = 4u32;
@@ -964,7 +967,39 @@ fn print_screen_opens_snipping_tool() -> bool {
             Some(&mut size),
         )
     };
-    r.is_ok() && data == 1
+    snipping_from_registry(r.is_ok().then_some(data), windows_build())
+}
+
+/// Pure decision: explicit value wins; absent = on for Windows 11 (build
+/// 22000+), off for Windows 10.
+fn snipping_from_registry(value: Option<u32>, build: u32) -> bool {
+    match value {
+        Some(v) => v == 1,
+        None => build >= 22000,
+    }
+}
+
+/// `CurrentBuildNumber` from the registry (0 if unreadable).
+fn windows_build() -> u32 {
+    let mut buf = [0u16; 16];
+    let mut size = std::mem::size_of_val(&buf) as u32;
+    // SAFETY: reads a short REG_SZ into a properly sized local UTF-16 buffer.
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            w!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"),
+            w!("CurrentBuildNumber"),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr() as *mut _),
+            Some(&mut size),
+        )
+    };
+    if r.is_err() {
+        return 0;
+    }
+    let n = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..n]).trim().parse().unwrap_or(0)
 }
 
 fn check_snipping_tool_conflict(_h: HWND) {
@@ -1068,6 +1103,19 @@ fn apply_autostart(config: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snipping_default_depends_on_windows_version() {
+        assert!(snipping_from_registry(None, 26200)); // Win11, never touched
+        assert!(!snipping_from_registry(None, 19045)); // Win10
+        assert!(!snipping_from_registry(Some(0), 26200)); // user turned it off
+        assert!(snipping_from_registry(Some(1), 19045));
+    }
+
+    #[test]
+    fn reads_a_real_build_number() {
+        assert!(windows_build() >= 10240);
+    }
 
     #[test]
     fn copy_utf16_truncates_and_terminates() {
