@@ -1916,7 +1916,10 @@ impl EditorApp {
         }
 
         if resp.drag_started_by(PointerButton::Primary) {
-            if let Some(p) = pos {
+            // egui reports a drag only after the pointer moved past a
+            // threshold; hit-test handles at the press point, not there.
+            let origin = ctx.input(|i| i.pointer.press_origin()).map(to_img);
+            if let Some(p) = origin.or(pos) {
                 self.commit_text();
                 self.begin_drag(p, tol, mods.command);
             }
