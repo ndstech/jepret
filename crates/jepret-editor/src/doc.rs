@@ -45,6 +45,11 @@ pub enum Tool {
 }
 
 impl Tool {
+    /// Tools whose click places or edits text.
+    pub fn is_text_tool(self) -> bool {
+        matches!(self, Tool::Text | Tool::TextBox | Tool::Callout)
+    }
+
     pub const ALL: [Tool; 16] = [
         Tool::Select,
         Tool::Crop,

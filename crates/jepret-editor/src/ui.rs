@@ -131,6 +131,10 @@ pub struct EditorApp {
     poly_draft: Option<Vec<Pt>>,
     drag_start: Pt,
     moving: bool,
+    /// Drag that grabbed an existing object while a drawing tool is active.
+    grabbing: bool,
+    /// Frames rendered (the real maximize is sent once the window shows).
+    frames: u32,
     /// Handle-resize gesture in progress.
     resizing: Option<Resize>,
     prop_editing: bool,
@@ -190,6 +194,8 @@ impl EditorApp {
             poly_draft: None,
             drag_start: Pt::default(),
             moving: false,
+            grabbing: false,
+            frames: 0,
             resizing: None,
             prop_editing: false,
             zoom: 1.0,
@@ -1396,7 +1402,7 @@ impl EditorApp {
                     }
                 }
 
-                let with_handles = self.s.tool == Tool::Select && self.s.selection().len() == 1;
+                let with_handles = !self.single_handles().is_empty();
                 for i in self.s.selection() {
                     if let Some(sh) = shapes.get(*i) {
                         let (min, max) = sh.bounds();
@@ -1532,6 +1538,8 @@ impl EditorApp {
             if let Some(p) = resp.hover_pos().map(to_img) {
                 if let Some((_, k)) = self.handle_at(p) {
                     ctx.set_cursor_icon(handle_cursor(k));
+                } else if self.grab_hit(p, tol, mods.command).is_some() {
+                    ctx.set_cursor_icon(egui::CursorIcon::Move);
                 }
             }
         }
@@ -1539,7 +1547,7 @@ impl EditorApp {
         if resp.drag_started_by(PointerButton::Primary) {
             if let Some(p) = pos {
                 self.commit_text();
-                self.begin_drag(p, tol);
+                self.begin_drag(p, tol, mods.command);
             }
         }
         if resp.dragged_by(PointerButton::Primary) {
@@ -1548,9 +1556,10 @@ impl EditorApp {
             }
         }
         if resp.drag_stopped_by(PointerButton::Primary) {
+            let grabbed = self.grabbing;
             self.finish_drag(base);
             // A click that wobbled into a tiny drag still places a vertex.
-            if self.s.tool == Tool::Polygon {
+            if self.s.tool == Tool::Polygon && !grabbed {
                 if let Some(p) = pos {
                     self.commit_text();
                     self.polygon_click(p, mods.shift);
@@ -1558,6 +1567,13 @@ impl EditorApp {
             }
         }
         if resp.clicked_by(PointerButton::Primary) {
+            if let Some(i) = pos.and_then(|p| self.grab_hit(p, tol, mods.command)) {
+                if !self.s.tool.is_text_tool() {
+                    self.commit_text();
+                    self.s.select_one(Some(i));
+                    return;
+                }
+            }
             if let Some(p) = pos {
                 match self.s.tool {
                     Tool::Select => {
@@ -1611,11 +1627,29 @@ impl EditorApp {
         }
     }
 
-    /// Handles of the selected shape, when exactly one is selected with the
-    /// Select tool (empty otherwise).
+    /// Drawing tools can grab existing objects (ShareX style): pressing on
+    /// one moves/selects it, pressing on empty canvas draws. Ctrl forces
+    /// drawing. Returns the object under `p` when it may be grabbed.
+    fn grab_hit(&self, p: Pt, tol: f32, force_draw: bool) -> Option<usize> {
+        let tool = self.s.tool;
+        let grabs = match tool {
+            Tool::Select => true,
+            Tool::Crop | Tool::Eyedropper => false,
+            Tool::Polygon => self.poly_draft.is_none(),
+            _ => !force_draw,
+        };
+        if !grabs || self.drawing.is_some() {
+            return None;
+        }
+        self.s.doc.hit_test(p, tol)
+    }
+
+    /// Handles of the selected shape, when exactly one is selected and the
+    /// tool can grab objects (empty otherwise).
     fn single_handles(&self) -> Vec<Handle> {
+        let tool_ok = !matches!(self.s.tool, Tool::Crop | Tool::Eyedropper) && self.poly_draft.is_none();
         match self.s.selection() {
-            [i] if self.s.tool == Tool::Select => {
+            [i] if tool_ok => {
                 self.s.doc.shapes().get(*i).map(Shape::handles).unwrap_or_default()
             }
             _ => Vec::new(),
@@ -1634,14 +1668,24 @@ impl EditorApp {
             .map(|(i, k, _)| (i, k))
     }
 
-    fn begin_drag(&mut self, p: Pt, tol: f32) {
+    fn begin_drag(&mut self, p: Pt, tol: f32, force_draw: bool) {
         self.moving = false;
+        self.grabbing = false;
         self.resizing = None;
         self.drag_start = p;
         if let Some((idx, _)) = self.handle_at(p) {
             let offset = self.single_handles().get(idx).map(|h| Pt::new(h.pos.x - p.x, h.pos.y - p.y)).unwrap_or_default();
             self.resizing = Some(Resize { idx, offset, began: false });
             return;
+        }
+        if self.s.tool != Tool::Select {
+            if let Some(i) = self.grab_hit(p, tol, force_draw) {
+                if !self.s.is_selected(i) {
+                    self.s.select_one(Some(i));
+                }
+                self.grabbing = true;
+                return;
+            }
         }
         let kind = match self.s.tool {
             Tool::Arrow => Some(ShapeKind::Arrow { a: p, b: p }),
@@ -1706,7 +1750,7 @@ impl EditorApp {
                 }
                 _ => {}
             }
-        } else if self.s.tool == Tool::Select && !self.s.selection().is_empty() && delta != Vec2::ZERO {
+        } else if (self.s.tool == Tool::Select || self.grabbing) && !self.s.selection().is_empty() && delta != Vec2::ZERO {
             if !self.moving {
                 self.s.doc.begin_edit();
                 self.moving = true;
@@ -1719,6 +1763,7 @@ impl EditorApp {
 
     fn finish_drag(&mut self, base: &Image) {
         self.moving = false;
+        self.grabbing = false;
         if self.resizing.take().is_some() {
             return;
         }
@@ -2015,6 +2060,7 @@ const GESTURES: &[(&str, &str)] = &[
     ("Alt", " = dari tengah"),
     ("Space", "+drag = geser kanvas"),
     ("Ctrl", "+scroll = zoom"),
+    ("Ctrl", "+drag di atas objek = tetap menggambar"),
     ("Esc", " batal dulu, baru tutup"),
 ];
 
@@ -2086,6 +2132,15 @@ fn make_texture(ctx: &Context, img: &Image) -> TextureHandle {
 impl eframe::App for EditorApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.poll_load(ctx);
+        // eframe shows the window after the first frame; a maximize set on
+        // the builder is lost on Windows, so ask once it is visible.
+        if self.frames < 3 {
+            self.frames += 1;
+            if self.frames == 2 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            }
+            ctx.request_repaint();
+        }
 
         // Buttons/sliders must not keep keyboard focus: Enter/Space/arrows
         // belong to the shortcut map (except while typing text).
@@ -2125,7 +2180,6 @@ pub fn run(path: PathBuf, config: Config) -> jepret_core::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_icon(std::sync::Arc::new(jepret_ui_theme::app_icon()))
             .with_inner_size([1280.0, 820.0])
-            .with_maximized(true)
             .with_min_inner_size([640.0, 400.0])
             .with_title("Jepret Editor"),
         ..Default::default()
