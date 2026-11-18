@@ -1791,11 +1791,24 @@ impl EditorApp {
         let Some(te) = &mut self.text_edit else { return };
         let mut commit = false;
         egui::Area::new(egui::Id::new("text_edit")).fixed_pos(to_screen(origin)).order(egui::Order::Foreground).show(ctx, |ui| {
+            // Same glyph size, line spacing and (nearly) wrap width as the
+            // CPU renderer, so the box grows exactly where the text wraps.
+            let size = (px * zoom * render::egui_font_factor()).max(6.0);
+            let row_h = render::line_height(px) * zoom;
+            let mut layouter = |ui: &egui::Ui, s: &str, wrap: f32| {
+                let mut job = egui::text::LayoutJob::single_section(
+                    s.to_owned(),
+                    egui::TextFormat { font_id: FontId::proportional(size), color, line_height: Some(row_h), ..Default::default() },
+                );
+                job.wrap.max_width = wrap;
+                ui.fonts(|f| f.layout_job(job))
+            };
             let mut edit = egui::TextEdit::multiline(&mut te.text)
-                .font(FontId::proportional((px * zoom).max(8.0)))
+                .font(FontId::proportional(size))
                 .text_color(color)
+                .layouter(&mut layouter)
                 .desired_rows(1)
-                .desired_width(width);
+                .desired_width(width + 0.5);
             edit = if framed {
                 edit.hint_text("Ctrl+Enter / click outside = done, Esc = cancel")
             } else {

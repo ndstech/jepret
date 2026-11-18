@@ -21,6 +21,16 @@ fn font() -> Option<&'static FontRef<'static>> {
 }
 
 /// Line height in px at font size `px`.
+/// egui sizes a font by its em (`size * height / units_per_em` px) while
+/// this renderer sizes by line height (`PxScale(px)`). Multiply a render
+/// size by this to get the egui size that draws the same glyphs.
+pub fn egui_font_factor() -> f32 {
+    font()
+        .and_then(|f| f.units_per_em().map(|u| u / f.height_unscaled()))
+        .filter(|k| k.is_finite() && *k > 0.0)
+        .unwrap_or(1.0)
+}
+
 pub fn line_height(px: f32) -> f32 {
     match font() {
         Some(f) => {
@@ -757,6 +767,12 @@ pub fn effect_preview(base: &Image, shape: &Shape) -> Option<(Rect, Image)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn egui_factor_shrinks_em_size_to_line_height() {
+        let k = egui_font_factor();
+        assert!(k > 0.5 && k <= 1.0, "{k}");
+    }
 
     fn solid(w: u32, h: u32, c: Rgba) -> Image {
         let mut img = Image::new(w, h);
