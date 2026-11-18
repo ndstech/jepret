@@ -260,6 +260,16 @@ impl Session {
         self.sel.clear();
     }
 
+    /// Move the object at doc index `from` to `to` (one undo step), keeping
+    /// the selection on the same objects.
+    pub fn move_object(&mut self, from: usize, to: usize) {
+        if self.doc.move_shape(from, to) {
+            for i in &mut self.sel {
+                *i = index_after_move(*i, from, to);
+            }
+        }
+    }
+
     pub fn delete_selection(&mut self) {
         let sel = std::mem::take(&mut self.sel);
         self.doc.remove_shapes(&sel);
@@ -457,6 +467,51 @@ pub fn finalize_polygon(draft: &[Pt]) -> Option<Vec<Pt>> {
         out.pop();
     }
     (out.len() >= 3).then_some(out)
+}
+
+/// Final document index when the shape at doc index `from` is dropped at
+/// list `slot` (0..=n). The list shows the front-most shape first, so slot
+/// `k` means "before display row k" (display row d = doc index n-1-d).
+pub fn drop_index(from: usize, slot: usize, n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let fd = (n - 1).saturating_sub(from);
+    let slot = slot.min(n);
+    let p = if slot > fd { slot - 1 } else { slot };
+    n - 1 - p.min(n - 1)
+}
+
+/// New index of the shape at `i` after the shape at `from` moved to `to`.
+pub fn index_after_move(i: usize, from: usize, to: usize) -> usize {
+    if i == from {
+        to
+    } else if from < to && i > from && i <= to {
+        i - 1
+    } else if from > to && i >= to && i < from {
+        i + 1
+    } else {
+        i
+    }
+}
+
+/// Selection after clicking list row (doc index) `i`: plain = only it,
+/// Ctrl = toggle, Shift = range from the last selected (or just `i`).
+pub fn click_select(cur: &[usize], i: usize, ctrl: bool, shift: bool) -> Vec<usize> {
+    if shift {
+        let anchor = cur.last().copied().unwrap_or(i);
+        return (anchor.min(i)..=anchor.max(i)).collect();
+    }
+    if ctrl {
+        let mut v: Vec<usize> = cur.to_vec();
+        if let Some(k) = v.iter().position(|x| *x == i) {
+            v.remove(k);
+        } else {
+            v.push(i);
+        }
+        return v;
+    }
+    vec![i]
 }
 
 #[cfg(test)]
@@ -719,5 +774,50 @@ mod tests {
         let (a, b) = constrain_drag(DragKind::Boxed, Pt::new(50.0, 50.0), Pt::new(60.0, 70.0), true, true);
         assert_eq!(a, Pt::new(30.0, 30.0));
         assert_eq!(b, Pt::new(70.0, 70.0));
+    }
+
+    #[test]
+    fn drop_index_maps_list_slots() {
+        // 4 shapes; list top = doc 3.
+        assert_eq!(drop_index(0, 0, 4), 3);
+        assert_eq!(drop_index(3, 4, 4), 0);
+        assert_eq!(drop_index(2, 1, 4), 2);
+        assert_eq!(drop_index(2, 2, 4), 2);
+        assert_eq!(drop_index(3, 2, 4), 2);
+        assert_eq!(drop_index(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn index_after_move_follows_shifts() {
+        assert_eq!(index_after_move(1, 1, 3), 3);
+        assert_eq!(index_after_move(2, 1, 3), 1);
+        assert_eq!(index_after_move(3, 1, 3), 2);
+        assert_eq!(index_after_move(0, 1, 3), 0);
+        assert_eq!(index_after_move(1, 3, 1), 2);
+        assert_eq!(index_after_move(3, 3, 1), 1);
+        assert_eq!(index_after_move(0, 3, 1), 0);
+    }
+
+    #[test]
+    fn click_select_modes() {
+        assert_eq!(click_select(&[1, 2], 4, false, false), vec![4]);
+        assert_eq!(click_select(&[1, 2], 2, true, false), vec![1]);
+        assert_eq!(click_select(&[1], 3, true, false), vec![1, 3]);
+        assert_eq!(click_select(&[1], 3, false, true), vec![1, 2, 3]);
+        assert_eq!(click_select(&[3], 1, false, true), vec![1, 2, 3]);
+        assert_eq!(click_select(&[], 2, false, true), vec![2]);
+    }
+
+    #[test]
+    fn move_object_keeps_selection_on_same_shapes() {
+        let mut s = Session::new(&jepret_core::config::EditorConfig::default());
+        for x in [0.0, 10.0, 20.0] {
+            let sh = s.new_shape(ShapeKind::Rect { a: Pt::new(x, 0.0), b: Pt::new(x + 5.0, 5.0) });
+            s.doc.add_shape(sh);
+        }
+        s.set_selection(vec![0]);
+        s.move_object(0, 2);
+        assert_eq!(s.selection(), &[2]);
+        assert_eq!(s.doc.shapes()[2].bounds().0.x, 0.0);
     }
 }

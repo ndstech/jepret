@@ -20,7 +20,7 @@ use jepret_core::shortcuts::{editor_shortcut, EDITOR_SHORTCUTS};
 use jepret_ui_theme::tokens::{
     CONTROL_H, RADIUS_CONTROL, RADIUS_PANEL, SP_1, SP_2, SP_3, SP_4, TEXT_BODY, TEXT_SMALL, TOOL_BTN,
 };
-use jepret_ui_theme::widgets::{button, kbd, primary_button, section_header, toggle, IconButton};
+use jepret_ui_theme::widgets::{button, kbd, primary_button, toggle, IconButton};
 use jepret_ui_theme::{icons, Icon, Palette};
 use jepret_core::{Config, Image, Rect};
 
@@ -70,14 +70,12 @@ fn pin_callout_width(sh: &mut Shape) {
 }
 
 const SCROLL_W: f32 = 8.0;
-const NAV_PAD: f32 = 6.0;
 
-/// Where the scrollbars and navigator go this frame (screen points).
+/// Where the scrollbars go this frame (screen points).
 struct Overlays {
     view: ERect,
     h_track: Option<ERect>,
     v_track: Option<ERect>,
-    nav_img: Option<ERect>,
 }
 
 impl Overlays {
@@ -93,13 +91,7 @@ impl Overlays {
             let bottom = view.max.y - m - if sx { SCROLL_W + m } else { 0.0 };
             ERect::from_min_max(pos2(view.max.x - m - SCROLL_W, view.min.y + m), pos2(view.max.x - m, bottom))
         });
-        let (nw, nh) = view::navigator_size(iw, ih, 200.0, 140.0);
-        let room = view.width() > nw * 2.5 && view.height() > nh * 2.0;
-        let nav_img = ((sx || sy) && room && nw > 0.0).then(|| {
-            let inset = 12.0 + NAV_PAD + SCROLL_W + m;
-            ERect::from_min_size(pos2(view.max.x - inset - nw, view.max.y - inset - nh), vec2(nw, nh))
-        });
-        Self { view, h_track, v_track, nav_img }
+        Self { view, h_track, v_track }
     }
 }
 
@@ -138,6 +130,12 @@ pub struct EditorApp {
     /// Handle-resize gesture in progress.
     resizing: Option<Resize>,
     prop_editing: bool,
+    /// Sidebar panel open state: PROPERTI, OBJEK, NAVIGATOR (session only).
+    panels_open: [bool; 3],
+    /// Object under the pointer in the OBJEK list (highlighted on the canvas).
+    hover_obj: Option<usize>,
+    /// Doc index of the list row being dragged to reorder.
+    obj_drag: Option<usize>,
 
     zoom: f32,
     pan: Vec2,
@@ -198,6 +196,9 @@ impl EditorApp {
             frames: 0,
             resizing: None,
             prop_editing: false,
+            panels_open: [true; 3],
+            hover_obj: None,
+            obj_drag: None,
             zoom: 1.0,
             pan: Vec2::ZERO,
             fit_pending: true,
@@ -835,36 +836,73 @@ impl EditorApp {
         r.response.rect
     }
 
+    /// Right sidebar: PROPERTI, OBJEK, NAVIGATOR (each collapsible). OBJEK takes
+    /// the height the other two leave; the whole column scrolls as a fallback.
     fn props_panel(&mut self, ctx: &Context) -> ERect {
         let pal = self.pal;
+        self.hover_obj = None;
         let r = egui::SidePanel::right("props")
-            .exact_width(248.0)
+            .exact_width(SIDE_W)
             .resizable(false)
-            .frame(egui::Frame::none().fill(pal.surface).inner_margin(egui::Margin::same(SP_4)))
+            .frame(egui::Frame::none().fill(pal.surface))
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 10.0;
-                    self.style_section(ui, ctx);
-                    self.object_section(ui, ctx);
+                let total = ui.available_height();
+                egui::ScrollArea::vertical().id_salt("side_scroll").auto_shrink([false, false]).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = Vec2::ZERO;
+                    let top = ui.cursor().top();
+                    self.properties_panel(ui, ctx, total * 0.6);
+                    let used = ui.cursor().top() - top;
+                    let nav_h = HEAD_H + 1.0 + if self.panels_open[2] { NAV_BODY_H } else { 0.0 };
+                    let obj_h = (total - used - nav_h).max(OBJ_MIN_H);
+                    self.objects_panel(ui, ctx, obj_h);
+                    self.navigator_panel(ui, ctx);
                 });
             });
         r.response.rect
     }
 
-    /// Colour swatches, width slider, fill/shadow toggles.
+    /// 1 px horizontal separator across the sidebar.
+    fn side_sep(&self, ui: &mut egui::Ui) {
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+        ui.painter().rect_filled(rect, 0.0, self.pal.line);
+    }
+
+    fn properties_panel(&mut self, ui: &mut egui::Ui, ctx: &Context, max_h: f32) {
+        let pal = self.pal;
+        let kind = match self.s.selection() {
+            [] => editor_shortcut(self.s.style_tool().id()).map(|d| d.label.to_string()).unwrap_or_default(),
+            [i] => self.s.doc.shapes().get(*i).map(|s| s.kind.display_name().to_string()).unwrap_or_default(),
+            sel => format!("{} objek", sel.len()),
+        };
+        let (_, clicked) = panel_header(ui, &pal, self.panels_open[0], "Properti", &kind, 0.0);
+        if clicked {
+            self.panels_open[0] = !self.panels_open[0];
+        }
+        if !self.panels_open[0] {
+            return;
+        }
+        egui::ScrollArea::vertical().id_salt("props_scroll").max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
+            egui::Frame::none().inner_margin(egui::Margin { left: SP_3, right: SP_3, top: 2.0, bottom: SP_3 }).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                self.style_section(ui, ctx);
+            });
+        });
+    }
+
+    /// Colour swatches, width slider, fill/shadow/outline toggles.
     fn style_section(&mut self, ui: &mut egui::Ui, ctx: &Context) {
         let pal = self.pal;
         // Crop has no style; keep the panel quiet until something is selected.
         if self.s.tool == Tool::Crop && self.s.selection().is_empty() {
+            ui.label(egui::RichText::new("Crop tidak punya properti").size(TEXT_SMALL).color(pal.muted));
             return;
         }
-        section_header(ui, &pal, "Warna");
         let palette = self.s.palette.clone();
         let cur = self.s.color_now();
-        let cell = ((ui.available_width() - 4.0 * SP_2) / 5.0).floor();
+        let cell = ((ui.available_width() - 4.0 * SP_1) / 5.0).floor();
         let mut cur32 = Color32::from_rgba_unmultiplied(cur[0], cur[1], cur[2], cur[3]);
         let mut picker_changed = false;
-        ui.spacing_mut().item_spacing = vec2(SP_2, SP_2);
+        ui.spacing_mut().item_spacing = vec2(SP_1, SP_1);
         for row in 0..2 {
             ui.horizontal(|ui| {
                 for col in 0..5 {
@@ -872,7 +910,7 @@ impl EditorApp {
                     if i < 9 {
                         let Some(c) = palette.get(i) else { continue };
                         let fill = Color32::from_rgb(c[0], c[1], c[2]);
-                        let (rect, resp) = ui.allocate_exact_size(vec2(cell, 34.0), Sense::click());
+                        let (rect, resp) = ui.allocate_exact_size(vec2(cell, 28.0), Sense::click());
                         let on = c[..3] == cur[..3];
                         let stroke = if on { Stroke::new(2.0_f32, pal.text) } else { Stroke::new(1.0_f32, pal.line) };
                         ui.painter().rect(rect, RADIUS_CONTROL, fill, stroke);
@@ -891,7 +929,7 @@ impl EditorApp {
                             self.run_command(ctx, &id, false);
                         }
                     } else if i == 9 {
-                        let (rect, resp) = ui.allocate_exact_size(vec2(cell, 34.0), Sense::click());
+                        let (rect, resp) = ui.allocate_exact_size(vec2(cell, 28.0), Sense::click());
                         if resp.hovered() {
                             ui.painter().rect_filled(rect, RADIUS_CONTROL, pal.raised);
                         }
@@ -925,14 +963,14 @@ impl EditorApp {
         let (kind, unit) = self.width_kind();
         let mut width = self.s.width_now();
         ui.horizontal(|ui| {
-            section_header(ui, &pal, kind);
+            ui.label(egui::RichText::new(kind).size(TEXT_SMALL).color(pal.muted));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = SP_1;
+                ui.label(egui::RichText::new(format!("{width:.0}{unit}")).size(TEXT_SMALL));
                 let (up, down) = (self.keymap.hint("style.width_up"), self.keymap.hint("style.width_down"));
                 if !up.is_empty() || !down.is_empty() {
                     ui.label(egui::RichText::new(format!("{down} {up}")).font(FontId::monospace(10.0)).color(pal.muted));
                 }
-                ui.label(egui::RichText::new(format!("{width:.0}{unit}")).size(TEXT_SMALL));
             });
         });
         let slider_changed = width_slider(ui, &pal, &mut width);
@@ -950,44 +988,283 @@ impl EditorApp {
         }
 
         ui.add_space(SP_2);
-        ui.spacing_mut().item_spacing.y = SP_1;
-        let mut fill = self.s.fill_now();
-        let h = self.sc("style.toggle_fill");
-        if toggle(ui, &pal, &mut fill, "Isi bentuk", h.as_deref()).changed() {
-            self.s.apply_fill(fill);
-        }
-        let mut sh = self.s.shadow_now();
-        let h = self.sc("style.toggle_shadow");
-        if toggle(ui, &pal, &mut sh, "Bayangan", h.as_deref()).changed() {
-            self.s.apply_shadow(sh);
-        }
         let sel_text = self.s.selection().first().and_then(|i| self.s.doc.shapes().get(*i)).is_some_and(|s| s.kind.is_text());
         let tool_text = matches!(self.s.style_tool(), Tool::Text | Tool::TextBox | Tool::Callout);
-        if sel_text || (self.s.selection().is_empty() && tool_text) {
-            let mut ol = self.s.outline_now();
-            let h = self.sc("style.toggle_outline");
-            if toggle(ui, &pal, &mut ol, "Garis tepi teks", h.as_deref()).changed() {
-                self.s.apply_outline(ol);
+        let show_outline = sel_text || (self.s.selection().is_empty() && tool_text);
+        let (mut fill, mut sh, mut ol) = (self.s.fill_now(), self.s.shadow_now(), self.s.outline_now());
+        let (h_fill, h_sh, h_ol) =
+            (self.sc("style.toggle_fill"), self.sc("style.toggle_shadow"), self.sc("style.toggle_outline"));
+        let (mut c_fill, mut c_sh, mut c_ol) = (false, false, false);
+        ui.columns(2, |cols| {
+            c_fill = toggle(&mut cols[0], &pal, &mut fill, "Isi", h_fill.as_deref()).changed();
+            c_sh = toggle(&mut cols[1], &pal, &mut sh, "Bayangan", h_sh.as_deref()).changed();
+            if show_outline {
+                c_ol = toggle(&mut cols[0], &pal, &mut ol, "Garis tepi", h_ol.as_deref()).changed();
             }
+        });
+        if c_fill {
+            self.s.apply_fill(fill);
         }
-        ui.add_space(SP_2);
+        if c_sh {
+            self.s.apply_shadow(sh);
+        }
+        if c_ol {
+            self.s.apply_outline(ol);
+        }
     }
 
-    fn object_section(&mut self, ui: &mut egui::Ui, ctx: &Context) {
+    /// OBJEK: header with order/duplicate/delete buttons, the z-ordered list
+    /// (front-most first) and a hint footer. Occupies exactly `height`.
+    fn objects_panel(&mut self, ui: &mut egui::Ui, ctx: &Context, height: f32) {
         let pal = self.pal;
-        let has_sel = !self.s.selection().is_empty();
-        ui.add_space(SP_2);
-        section_header(ui, &pal, "Objek terpilih");
-        ui.spacing_mut().item_spacing.y = SP_2;
-        for (label, id) in [
-            ("Duplikat", "edit.duplicate"),
-            ("Ke depan", "edit.bring_front"),
-            ("Ke belakang", "edit.send_back"),
-            ("Hapus", "edit.delete"),
-        ] {
-            let h = self.keymap.hint(id);
-            if list_button(ui, &pal, label, &h, has_sel).clicked() {
+        self.side_sep(ui);
+        let w = ui.available_width();
+        ui.allocate_ui_with_layout(vec2(w, height), egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_min_height(height);
+            let n = self.s.doc.shapes().len();
+            let has_sel = !self.s.selection().is_empty();
+            let title = format!("Objek ({n})");
+            let (head, clicked) = panel_header(ui, &pal, self.panels_open[1], &title, "", 4.0 * 26.0 + SP_2);
+            // Action buttons sit on top of the header (later widgets win the click).
+            let mut pressed: Option<&'static str> = None;
+            let acts: [(&str, &'static str); 4] = [
+                ("Ke depan", "edit.bring_front"),
+                ("Ke belakang", "edit.send_back"),
+                ("Duplikat", "edit.duplicate"),
+                ("Hapus", "edit.delete"),
+            ];
+            let mut x = head.right() - SP_2 - 24.0;
+            for (k, &(label, id)) in acts.iter().enumerate().rev() {
+                let r = ERect::from_min_size(pos2(x, head.center().y - 12.0), vec2(24.0, 24.0));
+                x -= 26.0;
+                let resp = ui.interact(r, ui.id().with(("obj_act", k)), Sense::click()).on_hover_text(self.tip(label, id));
+                let hot = has_sel && resp.hovered();
+                if hot {
+                    ui.painter().rect_filled(r, RADIUS_CONTROL, pal.raised);
+                }
+                let col = if !has_sel {
+                    pal.line_strong
+                } else if hot {
+                    pal.text
+                } else {
+                    pal.muted
+                };
+                let ir = ERect::from_center_size(r.center(), Vec2::splat(15.0));
+                match k {
+                    0 | 1 => paint_order_glyph(ui.painter(), ir, k == 0, col),
+                    2 => icons::paint(ui.painter(), ir, Icon::Copy, col, 2.0),
+                    _ => icons::paint(ui.painter(), ir, Icon::Trash, col, 2.0),
+                }
+                if has_sel && resp.clicked() {
+                    pressed = Some(id);
+                }
+            }
+            if clicked {
+                self.panels_open[1] = !self.panels_open[1];
+            }
+            if let Some(id) = pressed {
+                self.commit_text();
                 self.run_command(ctx, id, false);
+            }
+            if !self.panels_open[1] {
+                return;
+            }
+            self.side_sep(ui);
+            let foot_h = 38.0;
+            let list_h = (height - HEAD_H - 2.0 - foot_h).max(ROW_H);
+            self.object_list(ui, ctx, list_h);
+            self.side_sep(ui);
+            egui::Frame::none().inner_margin(egui::Margin::symmetric(SP_3, 6.0)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    egui::RichText::new("Ctrl+klik pilih banyak \u{b7} drag untuk urutan \u{b7} dobel-klik teks = edit")
+                        .size(11.0)
+                        .color(pal.muted),
+                );
+            });
+        });
+    }
+
+    fn object_list(&mut self, ui: &mut egui::Ui, ctx: &Context, list_h: f32) {
+        let pal = self.pal;
+        let n = self.s.doc.shapes().len();
+        if n == 0 {
+            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), list_h), Sense::hover());
+            ui.painter().text(rect.center(), Align2::CENTER_CENTER, "Belum ada objek", FontId::proportional(TEXT_SMALL), pal.muted);
+            return;
+        }
+        let labels = crate::doc::object_labels(self.s.doc.shapes());
+        let mods = ui.input(|i| i.modifiers);
+        let mut rects: Vec<ERect> = Vec::with_capacity(n);
+        let mut click: Option<usize> = None;
+        let mut dbl: Option<usize> = None;
+        let mut started: Option<usize> = None;
+        let mut stopped: Option<usize> = None;
+        let area = egui::ScrollArea::vertical().id_salt("obj_list").max_height(list_h).auto_shrink([false, false]);
+        let out = area.show(ui, |ui| {
+            for d in 0..n {
+                let i = n - 1 - d;
+                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click_and_drag());
+                rects.push(rect);
+                if !ui.is_rect_visible(rect) {
+                    continue;
+                }
+                let selected = self.s.is_selected(i);
+                if resp.hovered() {
+                    self.hover_obj = Some(i);
+                }
+                let p = ui.painter();
+                if selected {
+                    p.rect_filled(rect, 0.0, pal.accent_soft);
+                } else if resp.hovered() {
+                    p.rect_filled(rect, 0.0, pal.raised);
+                }
+                let cy = rect.center().y;
+                // Drag grip: 2 x 3 dots.
+                for cx in [rect.left() + 11.0, rect.left() + 15.0] {
+                    for dy in [-4.0, 0.0, 4.0] {
+                        p.circle_filled(pos2(cx, cy + dy), 1.0, pal.line_strong);
+                    }
+                }
+                let sh = &self.s.doc.shapes()[i];
+                let fg = if selected { pal.accent } else { pal.text };
+                let icon = tool_icon(sh.kind.tool());
+                icons::paint(p, ERect::from_center_size(pos2(rect.left() + 32.0, cy), Vec2::splat(16.0)), icon, fg, 2.0);
+                let label_rect = ERect::from_min_max(pos2(rect.left() + 48.0, rect.top()), pos2(rect.right() - 34.0, rect.bottom()));
+                p.with_clip_rect(label_rect).text(
+                    pos2(label_rect.left(), cy),
+                    Align2::LEFT_CENTER,
+                    labels.get(i).map(String::as_str).unwrap_or(""),
+                    FontId::proportional(TEXT_BODY),
+                    fg,
+                );
+                let [r, g, b, _] = sh.color;
+                p.rect(
+                    ERect::from_center_size(pos2(rect.right() - 20.0, cy), Vec2::splat(14.0)),
+                    3.0,
+                    Color32::from_rgb(r, g, b),
+                    Stroke::new(1.0_f32, pal.line_strong),
+                );
+                if resp.clicked() {
+                    click = Some(i);
+                }
+                if resp.double_clicked() {
+                    dbl = Some(i);
+                }
+                if resp.drag_started() {
+                    started = Some(i);
+                }
+                if resp.drag_stopped() {
+                    stopped = Some(i);
+                }
+            }
+        });
+        if let Some(i) = started {
+            self.commit_text();
+            self.obj_drag = Some(i);
+            if !self.s.is_selected(i) {
+                self.s.select_one(Some(i));
+            }
+        }
+        let ptr = ctx.input(|i| i.pointer.latest_pos());
+        // Insertion slot (0..=n, in list order) under the pointer.
+        let slot = ptr.map(|p| rects.iter().filter(|r| r.center().y < p.y).count());
+        if let (Some(_), Some(slot)) = (self.obj_drag, slot) {
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            if stopped.is_none() {
+                let view = out.inner_rect;
+                let y = match rects.get(slot) {
+                    Some(r) => r.top(),
+                    None => rects.last().map(|r| r.bottom()).unwrap_or(view.top()),
+                };
+                if y >= view.top() - 1.0 && y <= view.bottom() + 1.0 {
+                    let layer = ui.painter().with_clip_rect(view);
+                    layer.rect_filled(ERect::from_min_max(pos2(view.left() + 6.0, y - 1.0), pos2(view.right() - 6.0, y + 1.0)), 1.0, pal.accent);
+                    layer.circle_filled(pos2(view.left() + 6.0, y), 3.0, pal.accent);
+                }
+                // Scroll when dragging near the list edges.
+                if let Some(p) = ptr {
+                    let dy = if p.y < view.top() + 18.0 {
+                        6.0
+                    } else if p.y > view.bottom() - 18.0 {
+                        -6.0
+                    } else {
+                        0.0
+                    };
+                    if dy != 0.0 {
+                        ui.scroll_with_delta(vec2(0.0, dy));
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        }
+        if let (Some(i), Some(slot)) = (stopped, slot) {
+            // The list is drawn front-first, so list slot k maps to doc order.
+            let to = session::drop_index(i, slot, n);
+            self.s.move_object(i, to);
+            self.obj_drag = None;
+        } else if stopped.is_some() {
+            self.obj_drag = None;
+        }
+        if let Some(i) = click {
+            self.commit_text();
+            let sel = session::click_select(self.s.selection(), i, mods.ctrl || mods.command, mods.shift);
+            self.s.set_selection(sel);
+        }
+        if let Some(i) = dbl {
+            if self.s.doc.shapes().get(i).is_some_and(|s| s.kind.is_text()) {
+                self.s.select_one(Some(i));
+                self.edit_text_shape(i);
+            }
+        }
+    }
+
+    /// NAVIGATOR: thumbnail with the visible area; click/drag pans the view.
+    fn navigator_panel(&mut self, ui: &mut egui::Ui, ctx: &Context) {
+        let pal = self.pal;
+        self.side_sep(ui);
+        let zoom_txt = format!("{:.0}%", self.zoom * ctx.pixels_per_point() * 100.0);
+        let (_, clicked) = panel_header(ui, &pal, self.panels_open[2], "Navigator", &zoom_txt, 0.0);
+        if clicked {
+            self.panels_open[2] = !self.panels_open[2];
+        }
+        if !self.panels_open[2] {
+            return;
+        }
+        let w = ui.available_width();
+        let (outer, _) = ui.allocate_exact_size(vec2(w, NAV_BODY_H), Sense::hover());
+        let boxr = ERect::from_min_max(
+            pos2(outer.left() + SP_3, outer.top() + 2.0),
+            pos2(outer.right() - SP_3, outer.bottom() - SP_3),
+        );
+        ui.painter().rect(boxr, RADIUS_CONTROL, pal.canvas, Stroke::new(1.0_f32, pal.line));
+        let (Some(base), Some(tex)) = (self.base.clone(), self.tex.clone()) else { return };
+        let (iw, ih) = (base.width as f32, base.height as f32);
+        let (nw, nh) = view::navigator_size(iw, ih, boxr.width() - 16.0, boxr.height() - 16.0);
+        if nw <= 0.0 {
+            return;
+        }
+        let nav = ERect::from_center_size(boxr.center(), vec2(nw, nh));
+        let painter = ui.painter();
+        painter.image(tex.id(), nav, ERect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        let zoom = self.zoom;
+        let view_size = self.canvas_rect.size();
+        let k = nav.width() / iw.max(1.0) / zoom;
+        let vis = ERect::from_min_size(nav.min + (-self.pan) * k, view_size * k).intersect(nav);
+        painter.rect_filled(vis, 0.0, pal.accent.gamma_multiply(0.18));
+        painter.rect_stroke(vis, 0.0, Stroke::new(1.5_f32, pal.accent));
+        let r = ui.interact(boxr, egui::Id::new("jepret_navigator"), Sense::click_and_drag());
+        if r.hovered() || r.dragged() {
+            ctx.set_cursor_icon(egui::CursorIcon::Move);
+        }
+        if r.dragged() || r.clicked() || r.drag_started() {
+            if let Some(p) = r.interact_pointer_pos() {
+                let fx = ((p.x - nav.min.x) / nav.width()).clamp(0.0, 1.0);
+                let fy = ((p.y - nav.min.y) / nav.height()).clamp(0.0, 1.0);
+                self.pan = vec2(
+                    view::pan_centering(fx * iw, view_size.x, zoom),
+                    view::pan_centering(fy * ih, view_size.y, zoom),
+                );
             }
         }
     }
@@ -1314,7 +1591,7 @@ impl EditorApp {
                     ctx.set_cursor_icon(egui::CursorIcon::Grab);
                 }
 
-                // Scrollbars + navigator appear once the image outgrows the view.
+                // Scrollbars appear once the image outgrows the view.
                 let ov = Overlays::layout(rect, iw, ih, self.zoom);
                 let over_overlay = self.overlay_input(ui, &ov, iw, ih);
                 let (cw, ch) = (iw * self.zoom, ih * self.zoom);
@@ -1402,6 +1679,13 @@ impl EditorApp {
                     }
                 }
 
+                if let Some(sh) = self.hover_obj.and_then(|i| shapes.get(i)) {
+                    let (min, max) = sh.bounds();
+                    let r = ERect::from_min_max(to_screen(min), to_screen(max)).expand(3.0);
+                    painter.rect_filled(r, 2.0, pal.accent.gamma_multiply(0.12));
+                    painter.rect_stroke(r, 2.0, Stroke::new(1.5_f32, pal.accent));
+                }
+
                 let with_handles = !self.single_handles().is_empty();
                 for i in self.s.selection() {
                     if let Some(sh) = shapes.get(*i) {
@@ -1423,7 +1707,7 @@ impl EditorApp {
                     }
                 }
 
-                self.paint_overlays(&painter, &ov, &tex, iw, ih);
+                self.paint_overlays(&painter, &ov, iw, ih);
 
                 if self.text_edit.is_some() {
                     self.text_overlay(ctx, &to_screen, zoom);
@@ -1462,27 +1746,10 @@ impl EditorApp {
                 }
             }
         }
-        if let Some(nav) = ov.nav_img {
-            let r = ui.interact(nav.expand(NAV_PAD), egui::Id::new("jepret_navigator"), Sense::click_and_drag());
-            busy |= r.hovered() || r.dragged();
-            if r.hovered() || r.dragged() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
-            }
-            if r.dragged() || r.clicked() || r.drag_started() {
-                if let Some(p) = r.interact_pointer_pos() {
-                    let fx = ((p.x - nav.min.x) / nav.width()).clamp(0.0, 1.0);
-                    let fy = ((p.y - nav.min.y) / nav.height()).clamp(0.0, 1.0);
-                    self.pan = vec2(
-                        view::pan_centering(fx * iw, view.width(), zoom),
-                        view::pan_centering(fy * ih, view.height(), zoom),
-                    );
-                }
-            }
-        }
         busy
     }
 
-    fn paint_overlays(&self, painter: &egui::Painter, ov: &Overlays, tex: &TextureHandle, iw: f32, ih: f32) {
+    fn paint_overlays(&self, painter: &egui::Painter, ov: &Overlays, iw: f32, ih: f32) {
         let pal = self.pal;
         let view = ov.view;
         let (cw, ch) = (iw * self.zoom, ih * self.zoom);
@@ -1497,20 +1764,6 @@ impl EditorApp {
             painter.rect_filled(t, SCROLL_W / 2.0, track_c);
             let (s, l) = view::thumb(t.height(), view.height(), ch, self.pan.y);
             painter.rect_filled(ERect::from_min_size(pos2(t.min.x, t.min.y + s), vec2(t.width(), l)), SCROLL_W / 2.0, thumb_c);
-        }
-        if let Some(nav) = ov.nav_img {
-            let frame = nav.expand(NAV_PAD);
-            painter.add(
-                egui::epaint::Shadow { offset: vec2(0.0, 4.0), blur: 16.0, spread: 0.0, color: Color32::from_black_alpha(60) }
-                    .as_shape(frame, RADIUS_PANEL),
-            );
-            painter.rect(frame, RADIUS_PANEL, pal.raised, Stroke::new(1.0_f32, pal.line));
-            painter.image(tex.id(), nav, ERect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-            // Visible part of the image, in navigator space.
-            let k = nav.width() / iw.max(1.0) / self.zoom;
-            let vis = ERect::from_min_size(nav.min + (-self.pan) * k, view.size() * k).intersect(nav);
-            painter.rect_filled(vis, 0.0, Color32::from_white_alpha(28));
-            painter.rect_stroke(vis, 0.0, Stroke::new(1.5_f32, pal.accent));
         }
     }
 
@@ -2064,20 +2317,70 @@ const GESTURES: &[(&str, &str)] = &[
     ("Esc", " batal dulu, baru tutup"),
 ];
 
-/// Full-width outlined row button: label left, shortcut right (design:
-/// "Objek terpilih" actions). Local because `widgets::button` is content-sized.
-fn list_button(ui: &mut egui::Ui, pal: &Palette, label: &str, shortcut: &str, enabled: bool) -> egui::Response {
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), CONTROL_H), sense);
-    let fill = if enabled && resp.hovered() { pal.raised } else { Color32::TRANSPARENT };
-    let (fg, sc) = if enabled { (pal.text, pal.muted) } else { (pal.muted, pal.line_strong) };
+const SIDE_W: f32 = 272.0;
+const HEAD_H: f32 = 34.0;
+const ROW_H: f32 = 30.0;
+const NAV_BODY_H: f32 = 2.0 + 136.0 + SP_3;
+/// Smallest OBJEK region (header + a couple of rows + footer) before the
+/// sidebar falls back to scrolling.
+const OBJ_MIN_H: f32 = HEAD_H + 2.0 * ROW_H + 40.0;
+
+/// Collapsible panel header: chevron, upper-case muted title, optional
+/// right-hand text (kept clear of `reserve_right` px for extra buttons).
+/// Returns the header rect and whether it was clicked.
+fn panel_header(ui: &mut egui::Ui, pal: &Palette, open: bool, title: &str, right: &str, reserve_right: f32) -> (ERect, bool) {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), HEAD_H), Sense::click());
     let p = ui.painter();
-    p.rect(rect, RADIUS_CONTROL, fill, Stroke::new(1.0_f32, pal.line));
-    p.text(pos2(rect.left() + 10.0, rect.center().y), Align2::LEFT_CENTER, label, FontId::proportional(TEXT_BODY), fg);
-    if !shortcut.is_empty() {
-        p.text(pos2(rect.right() - 10.0, rect.center().y), Align2::RIGHT_CENTER, shortcut, FontId::monospace(10.0), sc);
+    if resp.hovered() {
+        p.rect_filled(rect, 0.0, pal.raised.gamma_multiply(0.5));
     }
-    resp
+    let c = pos2(rect.left() + 18.0, rect.center().y);
+    let st = Stroke::new(1.5_f32, pal.muted);
+    if open {
+        p.line_segment([c + vec2(-4.0, -2.0), c + vec2(0.0, 2.0)], st);
+        p.line_segment([c + vec2(0.0, 2.0), c + vec2(4.0, -2.0)], st);
+    } else {
+        p.line_segment([c + vec2(-2.0, -4.0), c + vec2(2.0, 0.0)], st);
+        p.line_segment([c + vec2(2.0, 0.0), c + vec2(-2.0, 4.0)], st);
+    }
+    p.text(
+        pos2(rect.left() + 32.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        title.to_uppercase(),
+        FontId::proportional(TEXT_SMALL),
+        pal.muted,
+    );
+    if !right.is_empty() {
+        p.text(
+            pos2(rect.right() - 12.0 - reserve_right, rect.center().y),
+            Align2::RIGHT_CENTER,
+            right,
+            FontId::proportional(TEXT_SMALL),
+            pal.text,
+        );
+    }
+    (rect, resp.clicked())
+}
+
+/// Icon of the tool that creates shapes of kind `t`.
+fn tool_icon(t: Tool) -> Icon {
+    Tool::ALL
+        .iter()
+        .position(|x| *x == t)
+        .and_then(|i| Icon::TOOLS.get(i))
+        .map(|(icon, _)| *icon)
+        .unwrap_or(Icon::Select)
+}
+
+/// "Ke depan" / "Ke belakang" glyph: a bar with an arrow pointing at it.
+fn paint_order_glyph(p: &egui::Painter, r: ERect, front: bool, col: Color32) {
+    let c = r.center();
+    let f = if front { -1.0 } else { 1.0 };
+    let st = Stroke::new(1.5_f32, col);
+    p.line_segment([c + vec2(-5.0, f * 6.0), c + vec2(5.0, f * 6.0)], st);
+    p.line_segment([c + vec2(0.0, -f * 6.0), c + vec2(0.0, f * 3.0)], st);
+    p.line_segment([c + vec2(-4.0, -f), c + vec2(0.0, f * 3.0)], st);
+    p.line_segment([c + vec2(4.0, -f), c + vec2(0.0, f * 3.0)], st);
 }
 
 /// Thin accent slider (4 px rail, 16 px knob) over `MIN_WIDTH..=MAX_WIDTH`.

@@ -189,6 +189,82 @@ impl ShapeKind {
     pub fn is_text(&self) -> bool {
         self.text().is_some()
     }
+
+    /// The tool that creates this kind of shape (icon / name in the object list).
+    pub fn tool(&self) -> Tool {
+        match self {
+            ShapeKind::Arrow { .. } => Tool::Arrow,
+            ShapeKind::Line { .. } => Tool::Line,
+            ShapeKind::Rect { .. } => Tool::Rect,
+            ShapeKind::Ellipse { .. } => Tool::Ellipse,
+            ShapeKind::Highlight { .. } => Tool::Highlight,
+            ShapeKind::Blur { .. } => Tool::Blur,
+            ShapeKind::Pixelate { .. } => Tool::Pixelate,
+            ShapeKind::Text { .. } => Tool::Text,
+            ShapeKind::TextBox { .. } => Tool::TextBox,
+            ShapeKind::Callout { .. } => Tool::Callout,
+            ShapeKind::Step { .. } => Tool::Step,
+            ShapeKind::Pen { .. } => Tool::Pen,
+            ShapeKind::Polygon { .. } => Tool::Polygon,
+        }
+    }
+
+    /// Short Indonesian name used for generated object labels.
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            ShapeKind::Arrow { .. } => "Panah",
+            ShapeKind::Line { .. } => "Garis",
+            ShapeKind::Rect { .. } => "Kotak",
+            ShapeKind::Ellipse { .. } => "Elips",
+            ShapeKind::Highlight { .. } => "Highlight",
+            ShapeKind::Blur { .. } => "Blur",
+            ShapeKind::Pixelate { .. } => "Pixelate",
+            ShapeKind::Text { .. } => "Teks",
+            ShapeKind::TextBox { .. } => "Kotak teks",
+            ShapeKind::Callout { .. } => "Callout",
+            ShapeKind::Step { .. } => "Nomor",
+            ShapeKind::Pen { .. } => "Pen",
+            ShapeKind::Polygon { .. } => "Polygon",
+        }
+    }
+}
+
+/// Max characters of a text shape's label in the object list.
+const LABEL_MAX_CHARS: usize = 40;
+
+/// Labels for the object list, one per shape in stacking order.
+/// Text shapes show their first non-empty line (elided); others are
+/// "<name> <n>" numbered per kind in creation order; steps show "Nomor <n>"
+/// with their own number.
+pub fn object_labels(shapes: &[Shape]) -> Vec<String> {
+    let mut counts: std::collections::HashMap<&'static str, usize> = std::collections::HashMap::new();
+    shapes
+        .iter()
+        .map(|s| {
+            let name = s.kind.display_name();
+            let c = counts.entry(name).or_insert(0);
+            *c += 1;
+            if let ShapeKind::Step { n, .. } = &s.kind {
+                return format!("{name} {n}");
+            }
+            if let Some(t) = s.kind.text() {
+                if let Some(line) = t.lines().map(str::trim).find(|l| !l.is_empty()) {
+                    return elide(line, LABEL_MAX_CHARS);
+                }
+            }
+            format!("{name} {c}")
+        })
+        .collect()
+}
+
+/// Cut `s` to `max` chars, ending with an ellipsis when shortened.
+pub fn elide(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('\u{2026}');
+    out
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1019,6 +1095,19 @@ impl Document {
         target
     }
 
+    /// Move the shape at `from` so it ends up at index `to` (one undo step).
+    /// Returns false (no undo point) when nothing would change.
+    pub fn move_shape(&mut self, from: usize, to: usize) -> bool {
+        let n = self.cur.shapes.len();
+        if from >= n || to >= n || from == to {
+            return false;
+        }
+        self.begin_edit();
+        let s = self.cur.shapes.remove(from);
+        self.cur.shapes.insert(to, s);
+        true
+    }
+
     /// Renumber all step shapes 1..n in stacking order. Returns whether
     /// anything changed (one undo step if so).
     pub fn reset_steps(&mut self) -> bool {
@@ -1515,5 +1604,40 @@ mod tests {
         let hh = s.handles();
         assert!((hh[3].pos.x - (h[3].pos.x + 50.0)).abs() < 1e-3);
         assert!((hh[7].pos.x - h[7].pos.x).abs() < 1e-3);
+    }
+
+    #[test]
+    fn object_labels_number_per_kind() {
+        let arrow = || mk(ShapeKind::Arrow { a: pt(0.0, 0.0), b: pt(1.0, 1.0) });
+        let rect = || mk(ShapeKind::Rect { a: pt(0.0, 0.0), b: pt(1.0, 1.0) });
+        let text = |t: &str| mk(ShapeKind::Text { pos: pt(0.0, 0.0), text: t.into() });
+        let step = |n| mk(ShapeKind::Step { center: pt(0.0, 0.0), n });
+        let shapes = vec![arrow(), rect(), arrow(), text("Halo\ndunia"), step(7), text("  "), text(&"x".repeat(60))];
+        let l = object_labels(&shapes);
+        assert_eq!(l[0], "Panah 1");
+        assert_eq!(l[1], "Kotak 1");
+        assert_eq!(l[2], "Panah 2");
+        assert_eq!(l[3], "Halo");
+        assert_eq!(l[4], "Nomor 7");
+        assert_eq!(l[5], "Teks 2");
+        assert_eq!(l[6].chars().count(), 40);
+        assert!(l[6].ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn move_shape_reorders_with_one_undo() {
+        let r = |x: f32| mk(ShapeKind::Rect { a: pt(x, 0.0), b: pt(x + 1.0, 1.0) });
+        let mut d = Document::new();
+        for x in [0.0, 10.0, 20.0] {
+            d.add_shape(r(x));
+        }
+        assert!(!d.move_shape(1, 1));
+        assert!(!d.move_shape(5, 0));
+        assert!(d.move_shape(0, 2));
+        let xs: Vec<f32> = d.shapes().iter().map(|s| s.bounds().0.x).collect();
+        assert_eq!(xs, vec![10.0, 20.0, 0.0]);
+        assert!(d.undo());
+        let xs: Vec<f32> = d.shapes().iter().map(|s| s.bounds().0.x).collect();
+        assert_eq!(xs, vec![0.0, 10.0, 20.0]);
     }
 }
