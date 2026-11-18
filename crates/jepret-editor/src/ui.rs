@@ -138,6 +138,8 @@ pub struct EditorApp {
     zoom: f32,
     pan: Vec2,
     fit_pending: bool,
+    /// View right after the last fit; while unchanged, a resized window refits.
+    fitted: Option<(f32, Vec2)>,
     canvas_rect: ERect,
     /// Pointer offset inside a scrollbar thumb while it is dragged.
     scroll_grab: f32,
@@ -193,6 +195,7 @@ impl EditorApp {
             zoom: 1.0,
             pan: Vec2::ZERO,
             fit_pending: true,
+            fitted: None,
             canvas_rect: ERect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0)),
             scroll_grab: 0.0,
             crop_before: None,
@@ -1263,14 +1266,19 @@ impl EditorApp {
                 let avail = ui.available_size();
                 let (resp, painter) = ui.allocate_painter(avail, Sense::click_and_drag());
                 let rect = resp.rect;
-                self.canvas_rect = rect.translate(-rect.min.to_vec2());
 
+                let resized = (rect.size() - self.canvas_rect.size()).length() > 0.5;
+                if resized && self.fitted == Some((self.zoom, self.pan)) {
+                    self.fit_pending = true;
+                }
+                self.canvas_rect = rect.translate(-rect.min.to_vec2());
                 if self.fit_pending && rect.width() > 10.0 {
                     let z = ((rect.width() - 24.0) / iw)
                         .min((rect.height() - 24.0) / ih)
                         .min(1.0 / ctx.pixels_per_point());
                     self.zoom = z.max(0.01);
-                    self.pan = vec2((rect.width() - iw * self.zoom) / 2.0, (rect.height() - ih * self.zoom) / 2.0);
+                    self.pan = vec2(((rect.width() - iw * self.zoom) / 2.0).round(), ((rect.height() - ih * self.zoom) / 2.0).round());
+                    self.fitted = Some((self.zoom, self.pan));
                     self.fit_pending = false;
                 }
 
@@ -2117,6 +2125,7 @@ pub fn run(path: PathBuf, config: Config) -> jepret_core::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_icon(std::sync::Arc::new(jepret_ui_theme::app_icon()))
             .with_inner_size([1280.0, 820.0])
+            .with_maximized(true)
             .with_min_inner_size([640.0, 400.0])
             .with_title("Jepret Editor"),
         ..Default::default()

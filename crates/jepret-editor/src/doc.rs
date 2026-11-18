@@ -620,13 +620,23 @@ impl Shape {
         let box_rect = self.box_rect();
         let width = self.width;
         let text_bounds = self.bounds();
-        match &mut self.kind {
+        let mut new_width = None;
+        let out = match &mut self.kind {
             ShapeKind::Arrow { a, b } | ShapeKind::Line { a, b } => {
                 let (fixed, moving) = if idx == 0 { (*b, &mut *a) } else { (*a, &mut *b) };
                 let (_, np) =
                     crate::session::constrain_drag(crate::session::DragKind::Segment, fixed, p, keep_aspect, false);
                 *moving = np;
                 idx
+            }
+            ShapeKind::TextBox { a, b, .. } | ShapeKind::Callout { a, b, .. } if is_corner(idx) => {
+                // Corners scale box and font together (aspect kept); edges reflow.
+                let Some((min, max)) = box_rect else { return idx };
+                let (nmin, nmax, ni) = drag_box(min, max, idx, p, true, min_w, min_h);
+                let k = (nmax.x - nmin.x) / (max.x - min.x).max(f32::EPSILON);
+                (*a, *b) = (nmin, nmax);
+                new_width = Some((width * k).max(1.0));
+                ni
             }
             ShapeKind::Rect { a, b }
             | ShapeKind::Ellipse { a, b }
@@ -714,8 +724,17 @@ impl Shape {
                 }
                 idx
             }
+        };
+        if let Some(w) = new_width {
+            self.width = w;
         }
+        out
     }
+}
+
+/// Corner handles of [`box_handles`] (both directions non-zero).
+fn is_corner(idx: usize) -> bool {
+    BOX_H.get(idx).is_some_and(|(x, y)| *x != 0 && *y != 0)
 }
 
 /// Distance from `p` to segment `a`-`b`.
@@ -1043,6 +1062,33 @@ impl Document {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn textbox_corner_scales_font_edge_reflows() {
+        let mut s = Shape::new(ShapeKind::TextBox { a: Pt::new(0.0, 0.0), b: Pt::new(200.0, 50.0), text: "hi".into() }, [0; 4], 4.0);
+        let se = box_idx(1, 1);
+        let (_, max) = s.bounds();
+        s.drag_handle(se, Pt::new(max.x * 2.0, max.y * 2.0), false);
+        assert!((s.width - 8.0).abs() < 0.05, "corner doubles font: {}", s.width);
+        let w = s.width;
+        let e = box_idx(1, 0);
+        s.drag_handle(e, Pt::new(600.0, 10.0), false);
+        assert_eq!(s.width, w, "edge keeps font size");
+        let (min, max) = s.bounds();
+        assert!((max.x - min.x - 600.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn callout_corner_scales_font_keeps_tip() {
+        let tip = Pt::new(0.0, 0.0);
+        let mut s = Shape::new(ShapeKind::Callout { tip, a: Pt::new(50.0, 50.0), b: Pt::new(250.0, 120.0), text: "hi".into() }, [0; 4], 4.0);
+        let hs = s.handles();
+        let se = box_idx(1, 1);
+        let from = hs[se].pos;
+        s.drag_handle(se, Pt::new(50.0 + (from.x - 50.0) * 1.5, 50.0 + (from.y - 50.0) * 1.5), false);
+        assert!(s.width > 5.0, "font grew: {}", s.width);
+        assert!(matches!(s.kind, ShapeKind::Callout { tip: t, .. } if t == tip));
+    }
 
     fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> Shape {
         Shape::new(

@@ -11,7 +11,7 @@ pub const MIN_THUMB: f32 = 24.0;
 
 /// True when `content` (scaled image length) does not fit in `view`.
 pub fn scrollable(view: f32, content: f32) -> bool {
-    content + 2.0 * MARGIN > view + 0.5
+    content > view + 0.5
 }
 
 /// Clamp `pan` on one axis: an image that fits is centred; a larger one
@@ -80,8 +80,9 @@ mod tests {
     #[test]
     fn clamp_is_continuous_at_the_threshold() {
         let view = 800.0;
-        let content = view - 2.0 * MARGIN;
-        assert_eq!(clamp_pan(0.0, view, content), MARGIN);
+        // At the threshold the centred pan (0) lies inside the scroll range.
+        assert_eq!(clamp_pan(0.0, view, view), 0.0);
+        assert_eq!(clamp_pan(0.0, view, view + 1.0), 0.0);
     }
 
     #[test]

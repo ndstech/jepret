@@ -292,6 +292,9 @@ impl Session {
                 let new = self.doc.duplicate_shapes(&sel, DUPLICATE_OFFSET);
                 if !new.is_empty() {
                     self.sel = new;
+                    // Only the Select tool moves objects; stay there so the
+                    // copy can be dragged straight away.
+                    self.tool = Tool::Select;
                 }
             }
             "edit.select_all" => {
