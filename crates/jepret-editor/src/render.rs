@@ -7,11 +7,139 @@ use jepret_core::{Image, Rect};
 
 use crate::doc::{Document, Pt, Rgba, Shape, ShapeKind};
 
+/// The UI font (Segoe UI Variable / Segoe UI) so saved text looks like the
+/// on-screen text; egui's bundled Ubuntu Light as the fallback.
 fn font() -> Option<&'static FontRef<'static>> {
     use std::sync::OnceLock;
     static FONT: OnceLock<Option<FontRef<'static>>> = OnceLock::new();
-    FONT.get_or_init(|| FontRef::try_from_slice(epaint_default_fonts::UBUNTU_LIGHT).ok())
-        .as_ref()
+    FONT.get_or_init(|| {
+        jepret_ui_theme::fonts::ui_font()
+            .and_then(|(_, b)| FontRef::try_from_slice(b).ok())
+            .or_else(|| FontRef::try_from_slice(epaint_default_fonts::UBUNTU_LIGHT).ok())
+    })
+    .as_ref()
+}
+
+/// Line height in px at font size `px`.
+pub fn line_height(px: f32) -> f32 {
+    match font() {
+        Some(f) => {
+            let sf = f.as_scaled(PxScale::from(px));
+            sf.height() + sf.line_gap()
+        }
+        None => px * 1.2,
+    }
+}
+
+/// Width in px of a single line.
+pub fn line_px_width(line: &str, px: f32) -> f32 {
+    match font() {
+        Some(f) => line_width(&f.as_scaled(PxScale::from(px)), line),
+        None => px * 0.5 * line.chars().count() as f32,
+    }
+}
+
+/// Greedy word wrap to `max_w` px. `\n` always breaks; words longer than a
+/// line are split between characters. Never returns an empty vec.
+pub fn wrap_text(text: &str, px: f32, max_w: f32) -> Vec<String> {
+    let mut out = Vec::new();
+    for para in text.split('\n') {
+        let mut line = String::new();
+        for (wi, word) in para.split(' ').enumerate() {
+            let candidate = if wi == 0 { word.to_string() } else { format!("{line} {word}") };
+            if line_px_width(&candidate, px) <= max_w {
+                line = candidate;
+                continue;
+            }
+            if !line.is_empty() {
+                out.push(std::mem::take(&mut line));
+            }
+            // `word` alone may still be too wide: split by characters.
+            for ch in word.chars() {
+                let mut t = line.clone();
+                t.push(ch);
+                if !line.is_empty() && line_px_width(&t, px) > max_w {
+                    out.push(std::mem::take(&mut line));
+                    line.push(ch);
+                } else {
+                    line = t;
+                }
+            }
+        }
+        out.push(line);
+    }
+    out
+}
+
+/// Inner padding of text boxes / callouts, as a fraction of the font size.
+pub const BOX_PAD_EM: f32 = 0.5;
+
+/// Resolved geometry of a [`ShapeKind::TextBox`] or [`ShapeKind::Callout`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoxLayout {
+    pub min: Pt,
+    pub max: Pt,
+    /// Top-left of the first text line.
+    pub text_pos: Pt,
+    /// Width available for text (wrap width for text boxes).
+    pub text_w: f32,
+    pub lines: Vec<String>,
+    pub radius: f32,
+}
+
+/// Text box: width from the drag, height grows to fit the wrapped text.
+pub fn textbox_layout(a: Pt, b: Pt, text: &str, px: f32) -> BoxLayout {
+    let (min, max) = norm(a, b);
+    let pad = px * BOX_PAD_EM;
+    let w = (max.x - min.x).max(px * 2.0 + 2.0 * pad);
+    let text_w = w - 2.0 * pad;
+    let lines = wrap_text(text, px, text_w);
+    let need = lines.len() as f32 * line_height(px) + 2.0 * pad;
+    let h = (max.y - min.y).max(need);
+    BoxLayout {
+        min,
+        max: Pt::new(min.x + w, min.y + h),
+        text_pos: Pt::new(min.x + pad, min.y + pad),
+        text_w,
+        lines,
+        radius: px * 0.3,
+    }
+}
+
+/// Callout bubble: sized to the text (explicit line breaks only).
+pub fn callout_layout(pos: Pt, text: &str, px: f32) -> BoxLayout {
+    let pad = px * BOX_PAD_EM;
+    let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+    let text_w = lines.iter().map(|l| line_px_width(l, px)).fold(px, f32::max);
+    let h = lines.len() as f32 * line_height(px);
+    BoxLayout {
+        min: pos,
+        max: Pt::new(pos.x + text_w + 2.0 * pad, pos.y + h + 2.0 * pad),
+        text_pos: Pt::new(pos.x + pad, pos.y + pad),
+        text_w,
+        lines,
+        radius: px * 0.45,
+    }
+}
+
+/// Black or white, whichever reads better on `c`.
+pub fn contrast_on(c: Rgba) -> Rgba {
+    let l = 0.299 * c[0] as f32 + 0.587 * c[1] as f32 + 0.114 * c[2] as f32;
+    if l > 150.0 {
+        [0, 0, 0, 255]
+    } else {
+        [255, 255, 255, 255]
+    }
+}
+
+/// Halo radius (px) for outlined text of font size `px`.
+pub fn halo_radius(px: f32) -> f32 {
+    (px * 0.1).max(1.5)
+}
+
+/// Border width (px) of an outline-only text box / callout.
+pub fn box_border(px: f32) -> f32 {
+    (px * 0.1).max(1.5)
 }
 
 /// Size `(w, h)` in px of `text` (multi-line allowed) at font size `px`.
@@ -136,8 +264,8 @@ pub fn draw_shape(canvas: &mut Image, src: &Image, shape: &Shape) {
                 pixelate_region(canvas, src, r, (shape.width * 2.0).round().max(2.0) as u32);
             }
         }
-        ShapeKind::Text { pos, text } => {
-            draw_text(canvas, *pos, text, shape.text_px(), c, false);
+        ShapeKind::Text { .. } | ShapeKind::TextBox { .. } | ShapeKind::Callout { .. } => {
+            draw_text_shape(canvas, shape, false);
         }
         ShapeKind::Step { center, n } => {
             let r = shape.step_radius();
@@ -277,6 +405,222 @@ fn draw_text(img: &mut Image, pos: Pt, text: &str, px: f32, color: Rgba, bold: b
             prev = Some(id);
         }
     }
+}
+
+/// Colour the text of `shape` is drawn in (contrasting on a filled box).
+pub fn text_color_of(shape: &Shape) -> Rgba {
+    let boxed = matches!(shape.kind, ShapeKind::TextBox { .. } | ShapeKind::Callout { .. });
+    if boxed && shape.fill && shape.color != crate::doc::SHADOW_COLOR {
+        contrast_on(shape.color)
+    } else {
+        shape.color
+    }
+}
+
+/// Draw a Text / TextBox / Callout (without its shadow). `hide_text` draws
+/// only the box (the UI shows a live text field there while editing).
+pub fn draw_text_shape(img: &mut Image, shape: &Shape, hide_text: bool) {
+    let px = shape.text_px();
+    let (lines, pos) = match &shape.kind {
+        ShapeKind::Text { pos, text } => (text.split('\n').map(str::to_string).collect::<Vec<_>>(), *pos),
+        ShapeKind::TextBox { a, b, text } => {
+            let l = textbox_layout(*a, *b, text, px);
+            let (lmin, lmax, r) = (l.min, l.max, l.radius);
+            paint_box(img, l.min, l.max, shape, &|x, y| sd_round_rect(x, y, lmin, lmax, r));
+            (l.lines, l.text_pos)
+        }
+        ShapeKind::Callout { tip, pos, text } => {
+            let l = callout_layout(*pos, text, px);
+            let tail = callout_tail(&l, *tip, px);
+            let (lmin, lmax, r) = (l.min, l.max, l.radius);
+            let sdf = |x: f32, y: f32| {
+                let d = sd_round_rect(x, y, lmin, lmax, r);
+                match &tail {
+                    Some(t) => d.min(sd_polygon(Pt::new(x, y), t)),
+                    None => d,
+                }
+            };
+            let bmin = Pt::new(l.min.x.min(tip.x), l.min.y.min(tip.y));
+            let bmax = Pt::new(l.max.x.max(tip.x), l.max.y.max(tip.y));
+            paint_box(img, bmin, bmax, shape, &sdf);
+            (l.lines, l.text_pos)
+        }
+        _ => return,
+    };
+    if hide_text {
+        return;
+    }
+    let tc = text_color_of(shape);
+    let boxed_fill = shape.fill && !matches!(shape.kind, ShapeKind::Text { .. });
+    let halo = (shape.outline && !boxed_fill).then(|| (contrast_on(tc), halo_radius(px)));
+    draw_text_lines(img, pos, &lines, px, tc, halo);
+}
+
+/// Solid box, or outline (+ white paper inside a callout).
+fn paint_box(img: &mut Image, min: Pt, max: Pt, shape: &Shape, sdf: &dyn Fn(f32, f32) -> f32) {
+    let bw = box_border(shape.text_px());
+    let bb = bbox(min, max, bw + 1.0);
+    if shape.fill {
+        paint(img, bb, shape.color, sdf);
+    } else {
+        if matches!(shape.kind, ShapeKind::Callout { .. }) && shape.color != crate::doc::SHADOW_COLOR {
+            // A bubble reads as a bubble only with paper inside.
+            paint(img, bb, [255, 255, 255, 255], sdf);
+        }
+        paint(img, bb, shape.color, |x, y| sdf(x, y).abs() - bw / 2.0);
+    }
+}
+
+/// Tail triangle from inside the bubble to `tip`; `None` when the tip is
+/// inside the bubble.
+fn callout_tail(l: &BoxLayout, tip: Pt, px: f32) -> Option<[Pt; 3]> {
+    if tip.x >= l.min.x && tip.x <= l.max.x && tip.y >= l.min.y && tip.y <= l.max.y {
+        return None;
+    }
+    let c = Pt::new((l.min.x + l.max.x) / 2.0, (l.min.y + l.max.y) / 2.0);
+    let (dx, dy) = (tip.x - c.x, tip.y - c.y);
+    let len = dx.hypot(dy).max(1e-3);
+    let hw = (px * 0.55).min((l.max.x - l.min.x).min(l.max.y - l.min.y) / 3.0);
+    let (nx, ny) = (-dy / len * hw, dx / len * hw);
+    Some([tip, Pt::new(c.x + nx, c.y + ny), Pt::new(c.x - nx, c.y - ny)])
+}
+
+fn sd_round_rect(x: f32, y: f32, min: Pt, max: Pt, r: f32) -> f32 {
+    let (cx, cy) = ((min.x + max.x) / 2.0, (min.y + max.y) / 2.0);
+    let r = r.min((max.x - min.x) / 2.0).min((max.y - min.y) / 2.0).max(0.0);
+    let qx = (x - cx).abs() - ((max.x - min.x) / 2.0 - r);
+    let qy = (y - cy).abs() - ((max.y - min.y) / 2.0 - r);
+    qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - r
+}
+
+/// Signed distance to a simple polygon (negative inside).
+fn sd_polygon(p: Pt, v: &[Pt]) -> f32 {
+    let mut d = f32::MAX;
+    let mut inside = false;
+    let n = v.len();
+    for i in 0..n {
+        let (a, b) = (v[i], v[(i + 1) % n]);
+        d = d.min(crate::doc::seg_dist(p, a, b));
+        if (a.y > p.y) != (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x {
+            inside = !inside;
+        }
+    }
+    if inside {
+        -d
+    } else {
+        d
+    }
+}
+
+/// Lines of text at `pos` (top-left), optionally with a halo `(colour, radius)`.
+fn draw_text_lines(img: &mut Image, pos: Pt, lines: &[String], px: f32, color: Rgba, halo: Option<(Rgba, f32)>) {
+    let Some(f) = font() else { return };
+    let scale = PxScale::from(px);
+    let sf = f.as_scaled(scale);
+    let line_h = sf.height() + sf.line_gap();
+    let r = halo.map(|h| h.1).unwrap_or(0.0);
+    let m = r.ceil() as i32 + 2;
+    let w = lines.iter().map(|l| line_width(&sf, l)).fold(0.0, f32::max).ceil() as i32 + 2 * m + 2;
+    let h = (line_h * lines.len().max(1) as f32).ceil() as i32 + 2 * m + 2;
+    let (ox, oy) = (pos.x.floor() as i32 - m, pos.y.floor() as i32 - m);
+    // Nothing to do off-canvas.
+    if ox >= img.width as i32 || oy >= img.height as i32 || ox + w <= 0 || oy + h <= 0 {
+        return;
+    }
+    let (wu, hu) = (w as usize, h as usize);
+    let mut mask = vec![0f32; wu * hu];
+    for (li, line) in lines.iter().enumerate() {
+        let mut x = pos.x - ox as f32;
+        let baseline = pos.y - oy as f32 + sf.ascent() + li as f32 * line_h;
+        let mut prev = None;
+        for ch in line.chars() {
+            let id = sf.glyph_id(ch);
+            if let Some(p) = prev {
+                x += sf.kern(p, id);
+            }
+            let g = id.with_scale_and_position(scale, point(x, baseline));
+            if let Some(og) = f.outline_glyph(g) {
+                let b = og.px_bounds();
+                og.draw(|gx, gy, cov| {
+                    let (mx, my) = (b.min.x as i32 + gx as i32, b.min.y as i32 + gy as i32);
+                    if mx >= 0 && my >= 0 && (mx as usize) < wu && (my as usize) < hu {
+                        let k = my as usize * wu + mx as usize;
+                        mask[k] = (mask[k] + cov).min(1.0);
+                    }
+                });
+            }
+            x += sf.h_advance(id);
+            prev = Some(id);
+        }
+    }
+    if let Some((hc, r)) = halo {
+        let halo = dilate(&mask, wu, hu, r);
+        blend_mask(img, ox, oy, wu, &halo, hc);
+    }
+    blend_mask(img, ox, oy, wu, &mask, color);
+}
+
+fn blend_mask(img: &mut Image, ox: i32, oy: i32, w: usize, mask: &[f32], color: Rgba) {
+    for (k, v) in mask.iter().enumerate() {
+        if *v > 0.0 {
+            blend(img, ox + (k % w) as i32, oy + (k / w) as i32, color, *v);
+        }
+    }
+}
+
+/// Anti-aliased dilation of a coverage mask by a disc of radius `r` px.
+pub fn dilate(mask: &[f32], w: usize, h: usize, r: f32) -> Vec<f32> {
+    let ri = r.ceil() as i32 + 1;
+    let mut offs = Vec::new();
+    for dy in -ri..=ri {
+        for dx in -ri..=ri {
+            let wgt = (r + 0.5 - (dx as f32).hypot(dy as f32)).clamp(0.0, 1.0);
+            if wgt > 0.0 {
+                offs.push((dx, dy, wgt));
+            }
+        }
+    }
+    let mut out = vec![0f32; mask.len()];
+    for y in 0..h as i32 {
+        for x in 0..w as i32 {
+            let mut best = 0f32;
+            for &(dx, dy, wgt) in &offs {
+                let (sx, sy) = (x + dx, y + dy);
+                if sx >= 0 && sy >= 0 && (sx as usize) < w && (sy as usize) < h {
+                    best = best.max(mask[sy as usize * w + sx as usize] * wgt);
+                }
+            }
+            out[y as usize * w + x as usize] = best;
+        }
+    }
+    out
+}
+
+/// Rasterise a text-bearing shape (with its shadow and halo) for the
+/// on-screen preview at `scale` x image resolution. Returns the image-px
+/// rectangle it covers (`min`, `max`) and the pixels.
+pub fn text_shape_preview(shape: &Shape, scale: f32, hide_text: bool) -> Option<(Pt, Pt, Image)> {
+    if !shape.kind.is_text() {
+        return None;
+    }
+    let px = shape.text_px();
+    let pad = halo_radius(px) + box_border(px) + crate::doc::SHADOW_OFFSET + 3.0;
+    let (bmin, bmax) = shape.bounds();
+    let min = Pt::new((bmin.x - pad).floor(), (bmin.y - pad).floor());
+    let max = Pt::new((bmax.x + pad).ceil(), (bmax.y + pad).ceil());
+    let (w, h) = (((max.x - min.x) * scale).ceil() as u32, ((max.y - min.y) * scale).ceil() as u32);
+    if w == 0 || h == 0 || w > 8192 || h > 8192 {
+        return None;
+    }
+    let mut local = shape.clone();
+    local.translate(-min.x, -min.y);
+    local.scale(scale);
+    let mut img = Image::new(w, h);
+    if let Some(sh) = local.shadow_of() {
+        draw_text_shape(&mut img, &sh, hide_text);
+    }
+    draw_text_shape(&mut img, &local, hide_text);
+    Some((min, max, img))
 }
 
 /// Box blur (two passes ~ gaussian) of `src` within `r`, written to `dst`.
@@ -606,6 +950,149 @@ mod tests {
         let sh = out.pixel(42, 42); // shadow only
         assert!(sh[0] < 255 && sh[0] == sh[1], "{sh:?}");
         assert_eq!(out.pixel(55, 55), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn wrap_breaks_words_and_long_runs() {
+        let px = 20.0;
+        let w = line_px_width("hello world", px);
+        let lines = wrap_text("hello world hello", px, w + 0.5);
+        assert_eq!(lines, vec!["hello world".to_string(), "hello".to_string()]);
+        let long = wrap_text("aaaaaaaaaaaaaaaaaaaa", px, line_px_width("aaaaa", px) + 0.5);
+        assert_eq!(long.len(), 4);
+        assert!(long.iter().all(|l| l == "aaaaa"));
+        assert_eq!(wrap_text("a\n\nb", px, 500.0).len(), 3);
+        assert_eq!(wrap_text("", px, 500.0), vec![String::new()]);
+    }
+
+    #[test]
+    fn textbox_grows_to_fit() {
+        let px = 18.0;
+        let one = textbox_layout(Pt::new(10.0, 10.0), Pt::new(200.0, 12.0), "hi", px);
+        let many = textbox_layout(Pt::new(10.0, 10.0), Pt::new(200.0, 12.0), "word word word word word word word word", px);
+        assert!(one.max.y > 12.0);
+        assert!(many.lines.len() > 1);
+        assert!(many.max.y > one.max.y);
+        assert_eq!(many.max.x, 200.0);
+        // a tall drag keeps its height
+        let tall = textbox_layout(Pt::new(0.0, 0.0), Pt::new(100.0, 300.0), "hi", px);
+        assert_eq!(tall.max.y, 300.0);
+    }
+
+    #[test]
+    fn contrast_picks_readable() {
+        assert_eq!(contrast_on([255, 255, 255, 255]), [0, 0, 0, 255]);
+        assert_eq!(contrast_on([253, 216, 53, 255]), [0, 0, 0, 255]);
+        assert_eq!(contrast_on([229, 57, 53, 255]), [255, 255, 255, 255]);
+        assert_eq!(contrast_on([0, 0, 0, 255]), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn dilate_grows_a_dot() {
+        let (w, h) = (9, 9);
+        let mut m = vec![0f32; w * h];
+        m[4 * w + 4] = 1.0;
+        let d = dilate(&m, w, h, 2.0);
+        assert_eq!(d[4 * w + 4], 1.0);
+        assert_eq!(d[4 * w + 5], 1.0);
+        assert!((d[4 * w + 6] - 0.5).abs() < 1e-6); // anti-aliased rim
+        assert_eq!(d[0], 0.0);
+    }
+
+    #[test]
+    fn outlined_text_gets_a_halo_on_same_colour_background() {
+        // Red text on a red background: without halo nothing changes.
+        let red = [229, 57, 53, 255];
+        let base = solid(160, 60, red);
+        let mut d = Document::new();
+        let mut s = Shape::new(ShapeKind::Text { pos: Pt::new(10.0, 10.0), text: "Halo".into() }, red, 4.0);
+        d.add_shape(s.clone());
+        assert_eq!(flatten(&base, &d).pixels, base.pixels);
+        s.outline = true;
+        let mut d = Document::new();
+        d.add_shape(s);
+        let out = flatten(&base, &d);
+        let white = out.pixels.chunks_exact(4).filter(|p| p[0] > 240 && p[1] > 240).count();
+        assert!(white > 30, "white={white}");
+    }
+
+    #[test]
+    fn filled_textbox_uses_contrasting_text() {
+        let base = solid(240, 120, [255, 255, 255, 255]);
+        let mut s = Shape::new(
+            ShapeKind::TextBox { a: Pt::new(10.0, 10.0), b: Pt::new(200.0, 20.0), text: "Catatan".into() },
+            [30, 136, 229, 255],
+            3.0,
+        );
+        s.fill = true;
+        let mut d = Document::new();
+        d.add_shape(s.clone());
+        let out = flatten(&base, &d);
+        // corner inside the padding is the fill colour
+        assert_eq!(out.pixel(16, 16), [30, 136, 229, 255]);
+        // some white text pixels inside the box
+        let (min, max) = s.bounds();
+        let mut white = 0;
+        for y in min.y as u32..max.y as u32 {
+            for x in min.x as u32..max.x as u32 {
+                if out.pixel(x, y)[0] > 200 {
+                    white += 1;
+                }
+            }
+        }
+        assert!(white > 20, "white={white}");
+        // outline-only: interior stays the background
+        s.fill = false;
+        let mut d = Document::new();
+        d.add_shape(s);
+        let out = flatten(&base, &d);
+        assert_eq!(out.pixel(16, 16), [255, 255, 255, 255]);
+        assert!(out.pixel(100, 10)[0] < 100, "border {:?}", out.pixel(100, 10));
+    }
+
+    #[test]
+    fn callout_tail_reaches_tip() {
+        let base = solid(300, 200, [0, 0, 0, 255]);
+        let mut s = Shape::new(
+            ShapeKind::Callout { tip: Pt::new(40.0, 170.0), pos: Pt::new(120.0, 20.0), text: "Klik ini".into() },
+            [255, 255, 255, 255],
+            3.0,
+        );
+        s.fill = true;
+        let mut d = Document::new();
+        d.add_shape(s.clone());
+        let out = flatten(&base, &d);
+        // near the tip, along the tail
+        assert!(out.pixel(46, 162)[0] > 128, "{:?}", out.pixel(46, 162));
+        // far from both bubble and tail
+        assert_eq!(out.pixel(250, 180), [0, 0, 0, 255]);
+        let (min, max) = s.bounds();
+        assert!(min.x <= 40.0 && max.y >= 170.0);
+        assert!(s.hit(Pt::new(60.0, 150.0), 2.0));
+        assert!(!s.hit(Pt::new(250.0, 180.0), 2.0));
+    }
+
+    #[test]
+    fn preview_matches_flatten() {
+        let base = Image::new(200, 100);
+        let mut s = Shape::new(
+            ShapeKind::TextBox { a: Pt::new(20.0, 20.0), b: Pt::new(150.0, 30.0), text: "abc def".into() },
+            [229, 57, 53, 255],
+            3.0,
+        );
+        s.fill = true;
+        let mut d = Document::new();
+        d.add_shape(s.clone());
+        let flat = flatten(&base, &d);
+        let (min, _max, img) = text_shape_preview(&s, 1.0, false).unwrap();
+        for y in 0..img.height {
+            for x in 0..img.width {
+                let (gx, gy) = (min.x as i32 + x as i32, min.y as i32 + y as i32);
+                if gx >= 0 && gy >= 0 && (gx as u32) < 200 && (gy as u32) < 100 {
+                    assert_eq!(img.pixel(x, y), flat.pixel(gx as u32, gy as u32), "at {gx},{gy}");
+                }
+            }
+        }
     }
 
     #[test]

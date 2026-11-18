@@ -33,6 +33,8 @@ pub enum Tool {
     Rect,
     Ellipse,
     Text,
+    TextBox,
+    Callout,
     Highlight,
     Blur,
     Pixelate,
@@ -42,7 +44,7 @@ pub enum Tool {
 }
 
 impl Tool {
-    pub const ALL: [Tool; 13] = [
+    pub const ALL: [Tool; 15] = [
         Tool::Select,
         Tool::Crop,
         Tool::Arrow,
@@ -50,6 +52,8 @@ impl Tool {
         Tool::Rect,
         Tool::Ellipse,
         Tool::Text,
+        Tool::TextBox,
+        Tool::Callout,
         Tool::Highlight,
         Tool::Blur,
         Tool::Pixelate,
@@ -67,6 +71,8 @@ impl Tool {
             Tool::Rect => "Rect",
             Tool::Ellipse => "Ellipse",
             Tool::Text => "Text",
+            Tool::TextBox => "Text box",
+            Tool::Callout => "Callout",
             Tool::Highlight => "Highlight",
             Tool::Blur => "Blur",
             Tool::Pixelate => "Pixelate",
@@ -86,6 +92,8 @@ impl Tool {
             Tool::Rect => "tool.rect",
             Tool::Ellipse => "tool.ellipse",
             Tool::Text => "tool.text",
+            Tool::TextBox => "tool.textbox",
+            Tool::Callout => "tool.callout",
             Tool::Highlight => "tool.highlight",
             Tool::Blur => "tool.blur",
             Tool::Pixelate => "tool.pixelate",
@@ -105,6 +113,7 @@ impl Tool {
             Tool::Highlight => 1.0,
             Tool::Blur | Tool::Pixelate => 6.0,
             Tool::Text => 4.0,
+            Tool::TextBox | Tool::Callout => 3.0,
             Tool::Step => 4.0,
             _ => 4.0,
         }
@@ -133,9 +142,41 @@ pub enum ShapeKind {
     Pixelate { a: Pt, b: Pt },
     /// Text anchored at its top-left corner; font px = `width * 6`.
     Text { pos: Pt, text: String },
+    /// Text wrapped inside a box. `a`/`b` = opposite corners of the dragged
+    /// area; the box grows downwards when the text needs more room.
+    /// `fill` = solid box (text in a contrasting colour), else outline only.
+    TextBox { a: Pt, b: Pt, text: String },
+    /// Speech bubble with its top-left corner at `pos` and a tail to `tip`.
+    /// The bubble sizes itself to the text.
+    Callout { tip: Pt, pos: Pt, text: String },
     /// Numbered circle; radius = `width * 4`.
     Step { center: Pt, n: u32 },
     Pen { points: Vec<Pt> },
+}
+
+impl ShapeKind {
+    /// The text of a text-bearing shape.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            ShapeKind::Text { text, .. } | ShapeKind::TextBox { text, .. } | ShapeKind::Callout { text, .. } => {
+                Some(text)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn text_mut(&mut self) -> Option<&mut String> {
+        match self {
+            ShapeKind::Text { text, .. } | ShapeKind::TextBox { text, .. } | ShapeKind::Callout { text, .. } => {
+                Some(text)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn is_text(&self) -> bool {
+        self.text().is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -148,6 +189,9 @@ pub struct Shape {
     pub fill: bool,
     /// Offset drop shadow.
     pub shadow: bool,
+    /// Contrasting halo around text (Text / TextBox / Callout) so it stays
+    /// readable on any background.
+    pub outline: bool,
 }
 
 pub const SHADOW_OFFSET: f32 = 3.0;
@@ -157,7 +201,7 @@ pub const STEP_RADIUS_PER_WIDTH: f32 = 4.0;
 
 impl Shape {
     pub fn new(kind: ShapeKind, color: Rgba, width: f32) -> Self {
-        Self { kind, color, width, fill: false, shadow: false }
+        Self { kind, color, width, fill: false, shadow: false, outline: false }
     }
 
     /// The drop-shadow companion shape, if this shape casts one.
@@ -185,6 +229,7 @@ impl Shape {
             _ => {
                 let mut s = self.clone();
                 s.color = SHADOW_COLOR;
+                s.outline = false;
                 s
             }
         };
@@ -219,9 +264,46 @@ impl Shape {
                 mv(b);
             }
             ShapeKind::Text { pos, .. } => mv(pos),
+            ShapeKind::TextBox { a, b, .. } => {
+                mv(a);
+                mv(b);
+            }
+            ShapeKind::Callout { tip, pos, .. } => {
+                mv(tip);
+                mv(pos);
+            }
             ShapeKind::Step { center, .. } => mv(center),
             ShapeKind::Pen { points } => points.iter_mut().for_each(mv),
         }
+    }
+
+    /// Scale every coordinate and the width by `k` (about the origin).
+    pub fn scale(&mut self, k: f32) {
+        let sc = |p: &mut Pt| {
+            p.x *= k;
+            p.y *= k;
+        };
+        match &mut self.kind {
+            ShapeKind::Arrow { a, b }
+            | ShapeKind::Line { a, b }
+            | ShapeKind::Rect { a, b }
+            | ShapeKind::Ellipse { a, b }
+            | ShapeKind::Highlight { a, b }
+            | ShapeKind::Blur { a, b }
+            | ShapeKind::Pixelate { a, b }
+            | ShapeKind::TextBox { a, b, .. } => {
+                sc(a);
+                sc(b);
+            }
+            ShapeKind::Text { pos, .. } => sc(pos),
+            ShapeKind::Callout { tip, pos, .. } => {
+                sc(tip);
+                sc(pos);
+            }
+            ShapeKind::Step { center, .. } => sc(center),
+            ShapeKind::Pen { points } => points.iter_mut().for_each(sc),
+        }
+        self.width *= k;
     }
 
     /// Axis-aligned bounds `(min, max)` in image px (stroke not included).
@@ -240,6 +322,17 @@ impl Shape {
             ShapeKind::Text { pos, text } => {
                 let (w, h) = crate::render::text_size(text, self.text_px());
                 (*pos, Pt::new(pos.x + w, pos.y + h))
+            }
+            ShapeKind::TextBox { a, b, text } => {
+                let l = crate::render::textbox_layout(*a, *b, text, self.text_px());
+                (l.min, l.max)
+            }
+            ShapeKind::Callout { tip, pos, text } => {
+                let l = crate::render::callout_layout(*pos, text, self.text_px());
+                (
+                    Pt::new(l.min.x.min(tip.x), l.min.y.min(tip.y)),
+                    Pt::new(l.max.x.max(tip.x), l.max.y.max(tip.y)),
+                )
             }
             ShapeKind::Step { center, .. } => {
                 let r = self.step_radius();
@@ -295,9 +388,17 @@ impl Shape {
             ShapeKind::Highlight { .. }
             | ShapeKind::Blur { .. }
             | ShapeKind::Pixelate { .. }
-            | ShapeKind::Text { .. } => {
+            | ShapeKind::Text { .. }
+            | ShapeKind::TextBox { .. } => {
                 let (min, max) = self.bounds();
                 p.x >= min.x - tol && p.x <= max.x + tol && p.y >= min.y - tol && p.y <= max.y + tol
+            }
+            ShapeKind::Callout { tip, pos, text } => {
+                let l = crate::render::callout_layout(*pos, text, self.text_px());
+                let in_bubble =
+                    p.x >= l.min.x - tol && p.x <= l.max.x + tol && p.y >= l.min.y - tol && p.y <= l.max.y + tol;
+                let c = Pt::new((l.min.x + l.max.x) / 2.0, (l.min.y + l.max.y) / 2.0);
+                in_bubble || seg_dist(p, *tip, c) <= self.text_px() * 0.4 + tol
             }
             ShapeKind::Step { center, .. } => center.dist(p) <= self.step_radius() + tol,
             ShapeKind::Pen { points } => {

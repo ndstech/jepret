@@ -22,6 +22,8 @@ pub enum Icon {
     Rect,
     Ellipse,
     Text,
+    TextBox,
+    Callout,
     Highlight,
     Blur,
     Pixelate,
@@ -64,6 +66,7 @@ impl Icon {
     /// Every icon, tools first.
     pub const ALL: &'static [Icon] = &[
         Icon::Select, Icon::Crop, Icon::Arrow, Icon::Line, Icon::Rect, Icon::Ellipse, Icon::Text,
+        Icon::TextBox, Icon::Callout,
         Icon::Highlight, Icon::Blur, Icon::Pixelate, Icon::Step, Icon::Pen, Icon::Eyedropper,
         Icon::Frame, Icon::Undo, Icon::Redo, Icon::Copy, Icon::Save, Icon::OpenExternal,
         Icon::Folder, Icon::Search, Icon::Star, Icon::Trash, Icon::Calendar, Icon::Close,
@@ -73,7 +76,7 @@ impl Icon {
     ];
 
     /// Editor tools in toolbar order, matching `tool.*` shortcut ids.
-    pub const TOOLS: [(Icon, &'static str); 13] = [
+    pub const TOOLS: [(Icon, &'static str); 15] = [
         (Icon::Select, "tool.select"),
         (Icon::Crop, "tool.crop"),
         (Icon::Arrow, "tool.arrow"),
@@ -81,6 +84,8 @@ impl Icon {
         (Icon::Rect, "tool.rect"),
         (Icon::Ellipse, "tool.ellipse"),
         (Icon::Text, "tool.text"),
+        (Icon::TextBox, "tool.textbox"),
+        (Icon::Callout, "tool.callout"),
         (Icon::Highlight, "tool.highlight"),
         (Icon::Blur, "tool.blur"),
         (Icon::Pixelate, "tool.pixelate"),
@@ -99,6 +104,8 @@ impl Icon {
             Icon::Rect => "M4 6h16v12H4z",
             Icon::Ellipse => "M12 5c4.4 0 8 3.1 8 7s-3.6 7-8 7-8-3.1-8-7 3.6-7 8-7z",
             Icon::Text => "M5 7V4h14v3 M12 4v16 M9 20h6",
+            Icon::TextBox => "M3 5h18v14H3z M8 9h8 M12 9v6",
+            Icon::Callout => "M4 4h16v11h-9l-4 4v-4H4z M8 8h8 M8 11h5",
             Icon::Highlight => "M15 4l5 5-8 8H7v-5z M4 20h16",
             Icon::Blur => "M12 9a3 3 0 1 1 0 6a3 3 0 1 1 0-6z M12 3.75a1.25 1.25 0 1 1 0 2.5a1.25 1.25 0 1 1 0-2.5z M19 10.75a1.25 1.25 0 1 1 0 2.5a1.25 1.25 0 1 1 0-2.5z M12 17.75a1.25 1.25 0 1 1 0 2.5a1.25 1.25 0 1 1 0-2.5z M5 10.75a1.25 1.25 0 1 1 0 2.5a1.25 1.25 0 1 1 0-2.5z M7 7h.01 M17 7h.01 M7 17h.01 M17 17h.01",
             Icon::Pixelate => "M5.125 5.125h1.75v1.75h-1.75z M13.125 5.125h1.75v1.75h-1.75z M9.125 9.125h1.75v1.75h-1.75z M17.125 9.125h1.75v1.75h-1.75z M5.125 13.125h1.75v1.75h-1.75z M13.125 13.125h1.75v1.75h-1.75z M9.125 17.125h1.75v1.75h-1.75z M17.125 17.125h1.75v1.75h-1.75z",
@@ -572,7 +579,7 @@ mod tests {
 
     #[test]
     fn all_icons_parse_and_stay_in_box() {
-        assert_eq!(Icon::ALL.len(), 41); // 13 tools + 28 ui icons
+        assert_eq!(Icon::ALL.len(), 43); // 15 tools + 28 ui icons
         for &i in Icon::ALL {
             let sp = parse_path(i.path()).unwrap_or_else(|e| panic!("{i:?}: {e}"));
             assert!(!sp.is_empty(), "{i:?}");

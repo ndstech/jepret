@@ -222,3 +222,4 @@ _(catat di sini setiap perubahan/penambahan API publik lintas crate)_
 - **gallery/settings/overlay/recorder:** hanya modul publik tambahan, signature lama tetap.
 - **core (T15):** `config::ThemeMode` + `General.theme` (System/Light/Dark). Crate baru `jepret-ui-theme`.
 - **workspace:** `rust-version` 1.88 (dipakai `as_chunks`), release `panic = "unwind"` supaya daemon bisa menangkap panic worker.
+- **core/ui-theme/editor:** shortcut baru `tool.textbox` (Shift+T), `tool.callout` (K), `style.toggle_outline` (O); `Icon::{TextBox, Callout}`, `Icon::TOOLS` jadi 15; `fonts::ui_font()` (bytes font UI dipakai bersama egui & renderer editor). Editor: `Tool::{TextBox, Callout}`, `ShapeKind::{TextBox, Callout}`, `Shape.outline`, `Shape::scale`.

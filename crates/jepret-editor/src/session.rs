@@ -15,6 +15,7 @@ pub struct Style {
     pub width: f32,
     pub fill: bool,
     pub shadow: bool,
+    pub outline: bool,
 }
 
 pub const MIN_WIDTH: f32 = 1.0;
@@ -71,8 +72,11 @@ fn default_style(t: Tool) -> Style {
     Style {
         color: t.default_color(),
         width: t.default_width(),
-        fill: false,
+        // Boxes/bubbles read best solid; free text gets a halo by default so
+        // it stays readable on any background.
+        fill: matches!(t, Tool::TextBox | Tool::Callout),
         shadow: false,
+        outline: t == Tool::Text,
     }
 }
 
@@ -197,6 +201,21 @@ impl Session {
         self.doc.edit_shapes(&sel, |s| s.shadow = on);
     }
 
+    pub fn apply_outline(&mut self, on: bool) {
+        let t = self.style_tool();
+        self.styles.entry(t).or_insert_with(|| default_style(t)).outline = on;
+        let sel = self.sel.clone();
+        self.doc.edit_shapes(&sel, |s| s.outline = on);
+    }
+
+    pub fn outline_now(&self) -> bool {
+        self.sel
+            .first()
+            .and_then(|i| self.doc.shapes().get(*i))
+            .map(|s| s.outline)
+            .unwrap_or_else(|| self.style().outline)
+    }
+
     /// Current value shown for fill/shadow: first selected shape if any.
     pub fn fill_now(&self) -> bool {
         self.sel
@@ -220,6 +239,7 @@ impl Session {
         let mut s = Shape::new(kind, st.color, st.width);
         s.fill = st.fill;
         s.shadow = st.shadow;
+        s.outline = st.outline;
         s
     }
 
@@ -263,6 +283,7 @@ impl Session {
             "style.width_down" => self.apply_width(self.width_now() - 1.0),
             "style.toggle_fill" => self.apply_fill(!self.fill_now()),
             "style.toggle_shadow" => self.apply_shadow(!self.shadow_now()),
+            "style.toggle_outline" => self.apply_outline(!self.outline_now()),
             "edit.undo" => self.undo(),
             "edit.redo" => self.redo(),
             "edit.delete" => self.delete_selection(),

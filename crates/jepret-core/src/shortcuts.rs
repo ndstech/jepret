@@ -48,6 +48,8 @@ pub const EDITOR_SHORTCUTS: &[ShortcutDef] = &[
     d("tool.rect", "Kotak", "Tool", &["r"]),
     d("tool.ellipse", "Elips", "Tool", &["e"]),
     d("tool.text", "Teks", "Tool", &["t"]),
+    d("tool.textbox", "Kotak teks", "Tool", &["shift+t"]),
+    d("tool.callout", "Callout", "Tool", &["k"]),
     d("tool.highlight", "Highlighter", "Tool", &["h"]),
     d("tool.blur", "Blur", "Tool", &["b"]),
     d("tool.pixelate", "Pixelate", "Tool", &["x"]),
@@ -68,6 +70,7 @@ pub const EDITOR_SHORTCUTS: &[ShortcutDef] = &[
     d("style.width_down", "Tipiskan", "Gaya", &["bracketleft"]),
     d("style.toggle_fill", "Isi / outline", "Gaya", &["f"]),
     d("style.toggle_shadow", "Bayangan on/off", "Gaya", &["s"]),
+    d("style.toggle_outline", "Garis tepi teks on/off", "Gaya", &["o"]),
     // ---- edit ----
     d("edit.undo", "Undo", "Edit", &["ctrl+z"]),
     d("edit.redo", "Redo", "Edit", &["ctrl+y", "ctrl+shift+z"]),

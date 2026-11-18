@@ -32,7 +32,8 @@ use crate::{io, render};
 type LoadResult = Result<Image, String>;
 
 struct TextEdit {
-    pos: Pt,
+    /// Shape being typed into (its own text is ignored; `text` is live).
+    kind: ShapeKind,
     text: String,
     /// Index of the shape being edited (None = new text).
     editing: Option<usize>,
@@ -72,6 +73,8 @@ pub struct EditorApp {
     last_title_dirty: Option<bool>,
     effect_cache: HashMap<u64, (Rect, TextureHandle)>,
     effect_used: HashSet<u64>,
+    /// Rasterised text shapes: image-px top-left, image-px size, texture.
+    text_cache: HashMap<u64, (Pt, Vec2, TextureHandle)>,
 }
 
 impl EditorApp {
@@ -118,6 +121,7 @@ impl EditorApp {
             last_title_dirty: None,
             effect_cache: HashMap::new(),
             effect_used: HashSet::new(),
+            text_cache: HashMap::new(),
         }
     }
 
@@ -280,7 +284,7 @@ impl EditorApp {
                     self.s.clear_selection();
                 } else {
                     self.s.doc.edit_shape(i, |sh| {
-                        if let ShapeKind::Text { text, .. } = &mut sh.kind {
+                        if let Some(text) = sh.kind.text_mut() {
                             *text = te.text.clone();
                         }
                     });
@@ -288,10 +292,36 @@ impl EditorApp {
             }
             None => {
                 if !te.text.trim().is_empty() {
-                    let sh = self.s.new_shape(ShapeKind::Text { pos: te.pos, text: te.text });
+                    let mut kind = te.kind;
+                    if let Some(text) = kind.text_mut() {
+                        *text = te.text;
+                    }
+                    let sh = self.s.new_shape(kind);
                     self.s.add_and_select(sh);
                 }
             }
+        }
+    }
+
+    /// Start typing into existing text shape `i`.
+    fn edit_text_shape(&mut self, i: usize) {
+        let Some(sh) = self.s.doc.shapes().get(i) else { return };
+        let Some(text) = sh.kind.text() else { return };
+        self.text_edit = Some(TextEdit { kind: sh.kind.clone(), text: text.to_string(), editing: Some(i), focus_pending: true });
+    }
+
+    /// Text shape for a click (or a too-small drag) with a text tool at `p`.
+    fn text_kind_at(&self, tool: Tool, p: Pt) -> Option<ShapeKind> {
+        let px = (self.s.style_of(tool).width * crate::doc::TEXT_PX_PER_WIDTH).max(6.0);
+        match tool {
+            Tool::Text => Some(ShapeKind::Text { pos: p, text: String::new() }),
+            Tool::TextBox => Some(ShapeKind::TextBox { a: p, b: Pt::new(p.x + px * 12.0, p.y), text: String::new() }),
+            Tool::Callout => Some(ShapeKind::Callout {
+                tip: p,
+                pos: Pt::new(p.x + px * 1.5, p.y - px * 3.5),
+                text: String::new(),
+            }),
+            _ => None,
         }
     }
 
@@ -532,7 +562,16 @@ impl EditorApp {
             (Tool::Blur | Tool::Pixelate, _) | (_, Some(ShapeKind::Blur { .. } | ShapeKind::Pixelate { .. })) => {
                 ("Kekuatan", "")
             }
-            (Tool::Text | Tool::Step, _) | (_, Some(ShapeKind::Text { .. } | ShapeKind::Step { .. })) => ("Ukuran", ""),
+            (Tool::Text | Tool::TextBox | Tool::Callout | Tool::Step, _)
+            | (
+                _,
+                Some(
+                    ShapeKind::Text { .. }
+                    | ShapeKind::TextBox { .. }
+                    | ShapeKind::Callout { .. }
+                    | ShapeKind::Step { .. },
+                ),
+            ) => ("Ukuran", ""),
             _ => ("Tebal", " px"),
         }
     }
@@ -544,6 +583,8 @@ impl EditorApp {
             Tool::Rect | Tool::Ellipse | Tool::Highlight | Tool::Blur | Tool::Pixelate => {
                 format!("{name} · Shift = proporsional · Alt = dari tengah")
             }
+            Tool::TextBox => format!("{name} · drag = lebar kotak, teks membungkus"),
+            Tool::Callout => format!("{name} · drag dari titik yang ditunjuk ke posisi balon"),
             _ => name.to_string(),
         }
     }
@@ -754,6 +795,15 @@ impl EditorApp {
         let h = self.sc("style.toggle_shadow");
         if toggle(ui, &pal, &mut sh, "Bayangan", h.as_deref()).changed() {
             self.s.apply_shadow(sh);
+        }
+        let sel_text = self.s.selection().first().and_then(|i| self.s.doc.shapes().get(*i)).is_some_and(|s| s.kind.is_text());
+        let tool_text = matches!(self.s.style_tool(), Tool::Text | Tool::TextBox | Tool::Callout);
+        if sel_text || (self.s.selection().is_empty() && tool_text) {
+            let mut ol = self.s.outline_now();
+            let h = self.sc("style.toggle_outline");
+            if toggle(ui, &pal, &mut ol, "Garis tepi teks", h.as_deref()).changed() {
+                self.s.apply_outline(ol);
+            }
         }
         ui.add_space(SP_2);
     }
@@ -1114,12 +1164,27 @@ impl EditorApp {
 
                 self.effect_used.clear();
                 let shapes: Vec<Shape> = self.s.doc.shapes().to_vec();
+                let editing = self.text_edit.as_ref().map(|te| (te.editing, te.text.clone()));
                 for (i, sh) in shapes.iter().enumerate() {
+                    if let Some((Some(ei), text)) = &editing {
+                        if *ei == i {
+                            let mut live = sh.clone();
+                            if let Some(t) = live.kind.text_mut() {
+                                t.clone_from(text);
+                            }
+                            self.paint_text_shape(ctx, &painter, &live, &to_screen, zoom, true);
+                            continue;
+                        }
+                    }
                     let skip_effect = self.moving && self.s.is_selected(i);
                     self.paint_shape(ctx, &painter, &base, sh, &to_screen, zoom, skip_effect);
                 }
+                if let Some(live) = self.live_text_shape().filter(|_| matches!(&editing, Some((None, _)))) {
+                    self.paint_text_shape(ctx, &painter, &live, &to_screen, zoom, true);
+                }
                 let used = std::mem::take(&mut self.effect_used);
                 self.effect_cache.retain(|k, _| used.contains(k));
+                self.text_cache.retain(|k, _| used.contains(k));
 
                 if let Some(d) = self.drawing.clone() {
                     if let ShapeKind::Blur { a, b } | ShapeKind::Pixelate { a, b } = &d.kind {
@@ -1198,9 +1263,15 @@ impl EditorApp {
                         let hit = self.s.doc.hit_test(p, tol);
                         self.s.select_one(hit);
                     }
-                    Tool::Text => {
+                    Tool::Text | Tool::TextBox | Tool::Callout => {
                         self.commit_text();
-                        self.text_edit = Some(TextEdit { pos: p, text: String::new(), editing: None, focus_pending: true });
+                        let tool = self.s.tool;
+                        let hit = self.s.doc.hit_test(p, tol).filter(|i| self.s.doc.shapes()[*i].kind.is_text());
+                        if let Some(i) = hit {
+                            self.edit_text_shape(i);
+                        } else if let Some(kind) = self.text_kind_at(tool, p) {
+                            self.text_edit = Some(TextEdit { kind, text: String::new(), editing: None, focus_pending: true });
+                        }
                     }
                     Tool::Step => {
                         let n = self.s.doc.next_step_number();
@@ -1221,8 +1292,8 @@ impl EditorApp {
         if resp.double_clicked_by(PointerButton::Primary) && self.s.tool == Tool::Select {
             if let Some(p) = pos {
                 if let Some(i) = self.s.doc.hit_test(p, tol) {
-                    if let ShapeKind::Text { pos, text } = &self.s.doc.shapes()[i].kind {
-                        self.text_edit = Some(TextEdit { pos: *pos, text: text.clone(), editing: Some(i), focus_pending: true });
+                    if self.s.doc.shapes()[i].kind.is_text() {
+                        self.edit_text_shape(i);
                     }
                 }
             }
@@ -1241,6 +1312,8 @@ impl EditorApp {
             Tool::Blur => Some(ShapeKind::Blur { a: p, b: p }),
             Tool::Pixelate => Some(ShapeKind::Pixelate { a: p, b: p }),
             Tool::Pen => Some(ShapeKind::Pen { points: vec![p] }),
+            Tool::TextBox => Some(ShapeKind::TextBox { a: p, b: p, text: String::new() }),
+            Tool::Callout => Some(ShapeKind::Callout { tip: p, pos: p, text: String::new() }),
             _ => None,
         };
         if self.s.tool == Tool::Select {
@@ -1265,9 +1338,11 @@ impl EditorApp {
                 | ShapeKind::Ellipse { a, b }
                 | ShapeKind::Highlight { a, b }
                 | ShapeKind::Blur { a, b }
-                | ShapeKind::Pixelate { a, b } => {
+                | ShapeKind::Pixelate { a, b }
+                | ShapeKind::TextBox { a, b, .. } => {
                     (*a, *b) = constrain_drag(DragKind::Boxed, start, p, mods.shift, mods.alt);
                 }
+                ShapeKind::Callout { pos, .. } => *pos = p,
                 ShapeKind::Pen { points } if points.last().is_none_or(|l| l.dist(p) >= 1.0) => {
                     points.push(p);
                 }
@@ -1299,6 +1374,14 @@ impl EditorApp {
             }
             return;
         }
+        // Text box / callout: the drag only places it; now type the text.
+        if let ShapeKind::TextBox { a, b, .. } | ShapeKind::Callout { tip: a, pos: b, .. } = &d.kind {
+            let kind = if a.dist(*b) < 8.0 { self.text_kind_at(self.s.tool, *a) } else { Some(d.kind.clone()) };
+            if let Some(kind) = kind {
+                self.text_edit = Some(TextEdit { kind, text: String::new(), editing: None, focus_pending: true });
+            }
+            return;
+        }
         let big_enough = match &d.kind {
             ShapeKind::Pen { points } => points.len() >= 2,
             ShapeKind::Arrow { a, b }
@@ -1315,22 +1398,51 @@ impl EditorApp {
         }
     }
 
-    fn text_overlay(&mut self, ctx: &Context, to_screen: &dyn Fn(Pt) -> Pos2, zoom: f32) {
-        let style = self.s.style_of(Tool::Text);
-        let Some(te) = &mut self.text_edit else { return };
-        let (color, px) = match te.editing.and_then(|i| self.s.doc.shapes().get(i)) {
-            Some(s) => (s.color, s.text_px()),
-            None => (style.color, (style.width * crate::doc::TEXT_PX_PER_WIDTH).max(6.0)),
+    /// The shape being typed, with the live text (style from the shape being
+    /// edited, else from the current tool).
+    fn live_text_shape(&self) -> Option<Shape> {
+        let te = self.text_edit.as_ref()?;
+        let mut sh = match te.editing.and_then(|i| self.s.doc.shapes().get(i)) {
+            Some(s) => s.clone(),
+            None => self.s.new_shape(te.kind.clone()),
         };
-        let pos = to_screen(te.pos);
+        if let Some(t) = sh.kind.text_mut() {
+            t.clone_from(&te.text);
+        }
+        Some(sh)
+    }
+
+    fn text_overlay(&mut self, ctx: &Context, to_screen: &dyn Fn(Pt) -> Pos2, zoom: f32) {
+        let Some(live) = self.live_text_shape() else { return };
+        let px = live.text_px();
+        let c = render::text_color_of(&live);
+        let color = Color32::from_rgba_unmultiplied(c[0], c[1], c[2], 255);
+        // (text top-left, wrap width in screen points, framed field?)
+        let (origin, width, framed) = match &live.kind {
+            ShapeKind::TextBox { a, b, text } => {
+                let l = render::textbox_layout(*a, *b, text, px);
+                (l.text_pos, l.text_w * zoom, false)
+            }
+            ShapeKind::Callout { pos, text, .. } => {
+                let l = render::callout_layout(*pos, text, px);
+                (l.text_pos, (l.text_w + px) * zoom, false)
+            }
+            ShapeKind::Text { pos, .. } => (*pos, 160.0, true),
+            _ => return,
+        };
+        let Some(te) = &mut self.text_edit else { return };
         let mut commit = false;
-        egui::Area::new(egui::Id::new("text_edit")).fixed_pos(pos).order(egui::Order::Foreground).show(ctx, |ui| {
-            let edit = egui::TextEdit::multiline(&mut te.text)
+        egui::Area::new(egui::Id::new("text_edit")).fixed_pos(to_screen(origin)).order(egui::Order::Foreground).show(ctx, |ui| {
+            let mut edit = egui::TextEdit::multiline(&mut te.text)
                 .font(FontId::proportional((px * zoom).max(8.0)))
-                .text_color(Color32::from_rgba_unmultiplied(color[0], color[1], color[2], 255))
+                .text_color(color)
                 .desired_rows(1)
-                .desired_width(160.0)
-                .hint_text("Ctrl+Enter / click outside = done, Esc = cancel");
+                .desired_width(width);
+            edit = if framed {
+                edit.hint_text("Ctrl+Enter / click outside = done, Esc = cancel")
+            } else {
+                edit.frame(false).margin(egui::Margin::ZERO).hint_text("Ketik teks…")
+            };
             let r = ui.add(edit);
             if te.focus_pending {
                 r.request_focus();
@@ -1345,6 +1457,38 @@ impl EditorApp {
         }
     }
 
+    /// Text / text box / callout via the CPU renderer (exactly what gets
+    /// saved), cached as a texture per shape state and zoom bucket.
+    fn paint_text_shape(
+        &mut self,
+        ctx: &Context,
+        painter: &egui::Painter,
+        s: &Shape,
+        to_screen: &dyn Fn(Pt) -> Pos2,
+        zoom: f32,
+        hide_text: bool,
+    ) {
+        let scale = ((zoom * ctx.pixels_per_point()).clamp(1.0, 4.0) * 2.0).round() / 2.0;
+        let key = {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            format!("{s:?}").hash(&mut h);
+            scale.to_bits().hash(&mut h);
+            hide_text.hash(&mut h);
+            h.finish()
+        };
+        self.effect_used.insert(key);
+        if let std::collections::hash_map::Entry::Vacant(e) = self.text_cache.entry(key) {
+            if let Some((min, _max, img)) = render::text_shape_preview(s, scale, hide_text) {
+                let size = vec2(img.width as f32 / scale, img.height as f32 / scale);
+                e.insert((min, size, make_texture(ctx, &img)));
+            }
+        }
+        if let Some((min, size, tex)) = self.text_cache.get(&key) {
+            let r = ERect::from_min_max(to_screen(*min), to_screen(Pt::new(min.x + size.x, min.y + size.y)));
+            painter.image(tex.id(), r, ERect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn paint_shape(
         &mut self,
@@ -1356,6 +1500,11 @@ impl EditorApp {
         zoom: f32,
         skip_effect: bool,
     ) {
+        if s.kind.is_text() {
+            // Shadow and halo are part of the rasterised text.
+            self.paint_text_shape(ctx, painter, s, to_screen, zoom, false);
+            return;
+        }
         if let Some(sh) = s.shadow_of() {
             self.paint_shape(ctx, painter, base, &sh, to_screen, zoom, skip_effect);
         }
@@ -1438,9 +1587,7 @@ impl EditorApp {
                     painter.image(tex.id(), rr, ERect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
                 }
             }
-            ShapeKind::Text { pos, text } => {
-                painter.text(to_screen(*pos), Align2::LEFT_TOP, text, FontId::proportional(s.text_px() * zoom), c);
-            }
+            ShapeKind::Text { .. } | ShapeKind::TextBox { .. } | ShapeKind::Callout { .. } => {}
             ShapeKind::Step { center, n } => {
                 let r = s.step_radius();
                 painter.circle_filled(to_screen(*center), r * zoom, c);

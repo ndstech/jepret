@@ -23,14 +23,28 @@ fn load_first(names: &[&str]) -> Option<(String, Vec<u8>)> {
     })
 }
 
+/// The UI font file (Segoe UI Variable / Segoe UI), read once and shared, so
+/// CPU text rendering (editor save) matches what egui shows.
+pub fn ui_font() -> Option<(&'static str, &'static [u8])> {
+    use std::sync::OnceLock;
+    static UI: OnceLock<Option<(String, Vec<u8>)>> = OnceLock::new();
+    UI.get_or_init(|| load_first(UI_CANDIDATES))
+        .as_ref()
+        .map(|(n, b)| (n.as_str(), b.as_slice()))
+}
+
 /// Put the system fonts first in each family, keeping egui's defaults as
 /// fallbacks (they cover symbols such as arrows and ✕).
 pub fn install(ctx: &egui::Context) {
     let mut defs = FontDefinitions::default();
-    for (family, candidates) in [
-        (FontFamily::Proportional, UI_CANDIDATES),
-        (FontFamily::Monospace, MONO_CANDIDATES),
-    ] {
+    match ui_font() {
+        Some((name, bytes)) => {
+            defs.font_data.insert(name.to_string(), FontData::from_static(bytes));
+            defs.families.entry(FontFamily::Proportional).or_default().insert(0, name.to_string());
+        }
+        None => tracing::warn!("no system font found among {UI_CANDIDATES:?}; using egui default"),
+    }
+    for (family, candidates) in [(FontFamily::Monospace, MONO_CANDIDATES)] {
         match load_first(candidates) {
             Some((name, bytes)) => {
                 defs.font_data.insert(name.clone(), FontData::from_owned(bytes));
