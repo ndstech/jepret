@@ -24,7 +24,7 @@ use jepret_ui_theme::widgets::{button, kbd, primary_button, section_header, togg
 use jepret_ui_theme::{icons, Icon, Palette};
 use jepret_core::{Config, Image, Rect};
 
-use crate::doc::{Pt, Shape, ShapeKind, Tool};
+use crate::doc::{Handle, HandleKind, Pt, Shape, ShapeKind, Tool};
 use crate::input::{combo_from_key, Keymap};
 use crate::session::{self, constrain_drag, DragKind, Effect, Session, ZoomCmd};
 use crate::{io, render};
@@ -44,6 +44,41 @@ struct TextEdit {
 const TOOL_GAP: f32 = 3.0;
 const TOOL_PAD: f32 = 6.0;
 const PANEL_W: f32 = TOOL_BTN * 2.0 + TOOL_GAP + TOOL_PAD * 2.0;
+/// A resize gesture: handle index of the (single) selected shape, the
+/// pointer-to-handle offset at grab time, and whether the undo point exists.
+struct Resize {
+    idx: usize,
+    offset: Pt,
+    began: bool,
+}
+
+/// Screen-space grab tolerance (points) around a resize handle.
+const HANDLE_GRAB: f32 = 8.0;
+
+/// A freshly typed (auto-width) callout gets its current width pinned so the
+/// handles can resize it later; the height stays automatic.
+fn pin_callout_width(sh: &mut Shape) {
+    let px = sh.text_px();
+    if let ShapeKind::Callout { tip, a, b, text } = &mut sh.kind {
+        if (b.x - a.x).abs() < 1.0 {
+            let l = render::callout_layout(*tip, *a, *b, text, px);
+            let y = if (a.y + b.y) / 2.0 < tip.y { l.max.y } else { l.min.y };
+            *a = Pt::new(l.min.x, y);
+            *b = Pt::new(l.max.x, y);
+        }
+    }
+}
+
+fn handle_cursor(k: HandleKind) -> egui::CursorIcon {
+    use egui::CursorIcon as C;
+    match k {
+        HandleKind::Nw | HandleKind::Se => C::ResizeNwSe,
+        HandleKind::Ne | HandleKind::Sw => C::ResizeNeSw,
+        HandleKind::N | HandleKind::S => C::ResizeVertical,
+        HandleKind::E | HandleKind::W => C::ResizeHorizontal,
+        HandleKind::Point | HandleKind::Tip => C::Crosshair,
+    }
+}
 
 pub struct EditorApp {
     path: PathBuf,
@@ -62,6 +97,8 @@ pub struct EditorApp {
     poly_draft: Option<Vec<Pt>>,
     drag_start: Pt,
     moving: bool,
+    /// Handle-resize gesture in progress.
+    resizing: Option<Resize>,
     prop_editing: bool,
 
     zoom: f32,
@@ -113,6 +150,7 @@ impl EditorApp {
             poly_draft: None,
             drag_start: Pt::default(),
             moving: false,
+            resizing: None,
             prop_editing: false,
             zoom: 1.0,
             pan: Vec2::ZERO,
@@ -304,7 +342,8 @@ impl EditorApp {
                     if let Some(text) = kind.text_mut() {
                         *text = te.text;
                     }
-                    let sh = self.s.new_shape(kind);
+                    let mut sh = self.s.new_shape(kind);
+                    pin_callout_width(&mut sh);
                     self.s.add_and_select(sh);
                 }
             }
@@ -324,11 +363,10 @@ impl EditorApp {
         match tool {
             Tool::Text => Some(ShapeKind::Text { pos: p, text: String::new() }),
             Tool::TextBox => Some(ShapeKind::TextBox { a: p, b: Pt::new(p.x + px * 12.0, p.y), text: String::new() }),
-            Tool::Callout => Some(ShapeKind::Callout {
-                tip: p,
-                pos: Pt::new(p.x + px * 1.5, p.y - px * 3.5),
-                text: String::new(),
-            }),
+            Tool::Callout => {
+                let c = Pt::new(p.x + px * 1.5, p.y - px * 3.5);
+                Some(ShapeKind::Callout { tip: p, a: c, b: c, text: String::new() })
+            }
             _ => None,
         }
     }
@@ -1282,6 +1320,7 @@ impl EditorApp {
                     }
                 }
 
+                let with_handles = self.s.tool == Tool::Select && self.s.selection().len() == 1;
                 for i in self.s.selection() {
                     if let Some(sh) = shapes.get(*i) {
                         let (min, max) = sh.bounds();
@@ -1289,9 +1328,15 @@ impl EditorApp {
                         let st = Stroke::new(1.5_f32, pal.accent);
                         let c = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
                         painter.extend(EShape::dashed_line(&c, st, 5.0, 3.0));
-                        for h in &c[..4] {
-                            let hr = ERect::from_center_size(*h, Vec2::splat(7.0));
-                            painter.rect(hr, 0.0, Color32::WHITE, st);
+                        if with_handles {
+                            for h in sh.handles() {
+                                let c = to_screen(h.pos);
+                                if h.kind == HandleKind::Tip {
+                                    painter.circle(c, 5.5, Color32::from_rgb(255, 150, 0), Stroke::new(1.5_f32, Color32::WHITE));
+                                } else {
+                                    painter.rect(ERect::from_center_size(c, Vec2::splat(7.0)), 0.0, Color32::WHITE, st);
+                                }
+                            }
                         }
                     }
                 }
@@ -1316,6 +1361,19 @@ impl EditorApp {
         let tol = 6.0 / self.zoom;
         let pos = resp.interact_pointer_pos().or_else(|| resp.hover_pos()).map(to_img);
         let mods = ctx.input(|i| i.modifiers);
+
+        if let Some(r) = &self.resizing {
+            let kind = self.single_handles().get(r.idx).map(|h| h.kind);
+            if let Some(k) = kind {
+                ctx.set_cursor_icon(handle_cursor(k));
+            }
+        } else if resp.hovered() && !self.moving {
+            if let Some(p) = resp.hover_pos().map(to_img) {
+                if let Some((_, k)) = self.handle_at(p) {
+                    ctx.set_cursor_icon(handle_cursor(k));
+                }
+            }
+        }
 
         if resp.drag_started_by(PointerButton::Primary) {
             if let Some(p) = pos {
@@ -1392,9 +1450,38 @@ impl EditorApp {
         }
     }
 
+    /// Handles of the selected shape, when exactly one is selected with the
+    /// Select tool (empty otherwise).
+    fn single_handles(&self) -> Vec<Handle> {
+        match self.s.selection() {
+            [i] if self.s.tool == Tool::Select => {
+                self.s.doc.shapes().get(*i).map(Shape::handles).unwrap_or_default()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Nearest resize handle of the selected shape within the grab radius.
+    fn handle_at(&self, p: Pt) -> Option<(usize, HandleKind)> {
+        let tol = HANDLE_GRAB / self.zoom.max(0.01);
+        self.single_handles()
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (i, h.kind, h.pos.dist(p)))
+            .filter(|(_, _, d)| *d <= tol)
+            .min_by(|a, b| a.2.total_cmp(&b.2))
+            .map(|(i, k, _)| (i, k))
+    }
+
     fn begin_drag(&mut self, p: Pt, tol: f32) {
         self.moving = false;
+        self.resizing = None;
         self.drag_start = p;
+        if let Some((idx, _)) = self.handle_at(p) {
+            let offset = self.single_handles().get(idx).map(|h| Pt::new(h.pos.x - p.x, h.pos.y - p.y)).unwrap_or_default();
+            self.resizing = Some(Resize { idx, offset, began: false });
+            return;
+        }
         let kind = match self.s.tool {
             Tool::Arrow => Some(ShapeKind::Arrow { a: p, b: p }),
             Tool::Line => Some(ShapeKind::Line { a: p, b: p }),
@@ -1405,7 +1492,7 @@ impl EditorApp {
             Tool::Pixelate => Some(ShapeKind::Pixelate { a: p, b: p }),
             Tool::Pen => Some(ShapeKind::Pen { points: vec![p] }),
             Tool::TextBox => Some(ShapeKind::TextBox { a: p, b: p, text: String::new() }),
-            Tool::Callout => Some(ShapeKind::Callout { tip: p, pos: p, text: String::new() }),
+            Tool::Callout => Some(ShapeKind::Callout { tip: p, a: p, b: p, text: String::new() }),
             _ => None,
         };
         if self.s.tool == Tool::Select {
@@ -1421,6 +1508,19 @@ impl EditorApp {
 
     fn update_drag(&mut self, p: Pt, delta: Vec2, mods: Modifiers) {
         let start = self.drag_start;
+        if let Some(r) = &mut self.resizing {
+            let Some(&i) = self.s.selection().first() else { return };
+            if !r.began {
+                self.s.doc.begin_edit();
+                r.began = true;
+            }
+            let target = Pt::new(p.x + r.offset.x, p.y + r.offset.y);
+            if let Some(sh) = self.s.doc.shape_live(i) {
+                r.idx = sh.drag_handle(r.idx, target, mods.shift);
+                self.s.doc.touch();
+            }
+            return;
+        }
         if let Some(d) = &mut self.drawing {
             match &mut d.kind {
                 ShapeKind::Arrow { a, b } | ShapeKind::Line { a, b } => {
@@ -1434,7 +1534,12 @@ impl EditorApp {
                 | ShapeKind::TextBox { a, b, .. } => {
                     (*a, *b) = constrain_drag(DragKind::Boxed, start, p, mods.shift, mods.alt);
                 }
-                ShapeKind::Callout { pos, .. } => *pos = p,
+                // The drag end is the bubble corner nearest the tip; the
+                // bubble grows away from the tip (auto width until resized).
+                ShapeKind::Callout { a, b, .. } => {
+                    *a = p;
+                    *b = p;
+                }
                 ShapeKind::Pen { points } if points.last().is_none_or(|l| l.dist(p) >= 1.0) => {
                     points.push(p);
                 }
@@ -1453,6 +1558,9 @@ impl EditorApp {
 
     fn finish_drag(&mut self, base: &Image) {
         self.moving = false;
+        if self.resizing.take().is_some() {
+            return;
+        }
         let Some(d) = self.drawing.take() else { return };
         if self.s.tool == Tool::Crop {
             if let ShapeKind::Rect { a, b } = d.kind {
@@ -1467,7 +1575,7 @@ impl EditorApp {
             return;
         }
         // Text box / callout: the drag only places it; now type the text.
-        if let ShapeKind::TextBox { a, b, .. } | ShapeKind::Callout { tip: a, pos: b, .. } = &d.kind {
+        if let ShapeKind::TextBox { a, b, .. } | ShapeKind::Callout { tip: a, b, .. } = &d.kind {
             let kind = if a.dist(*b) < 8.0 { self.text_kind_at(self.s.tool, *a) } else { Some(d.kind.clone()) };
             if let Some(kind) = kind {
                 self.text_edit = Some(TextEdit { kind, text: String::new(), editing: None, focus_pending: true });
@@ -1515,9 +1623,11 @@ impl EditorApp {
                 let l = render::textbox_layout(*a, *b, text, px);
                 (l.text_pos, l.text_w * zoom, false)
             }
-            ShapeKind::Callout { pos, text, .. } => {
-                let l = render::callout_layout(*pos, text, px);
-                (l.text_pos, (l.text_w + px) * zoom, false)
+            ShapeKind::Callout { tip, a, b, text } => {
+                let l = render::callout_layout(*tip, *a, *b, text, px);
+                // auto-width bubbles get room to type into; fixed ones wrap
+                let slack = if (b.x - a.x).abs() < 1.0 { px } else { 0.0 };
+                (l.text_pos, (l.text_w + slack) * zoom, false)
             }
             ShapeKind::Text { pos, .. } => (*pos, 160.0, true),
             _ => return,
