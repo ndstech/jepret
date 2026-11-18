@@ -106,16 +106,34 @@ pub fn textbox_layout(a: Pt, b: Pt, text: &str, px: f32) -> BoxLayout {
     }
 }
 
-/// Callout bubble: sized to the text (explicit line breaks only).
-pub fn callout_layout(pos: Pt, text: &str, px: f32) -> BoxLayout {
+/// Widest an auto-sized callout bubble gets before its text wraps (in em).
+pub const CALLOUT_MAX_EM: f32 = 16.0;
+
+/// Callout bubble. `a`/`b` are opposite corners of the box. When the box is
+/// (almost) zero wide it is *auto*-sized: as wide as the text (up to
+/// [`CALLOUT_MAX_EM`], then wrapping), extending away from `tip`. The height
+/// grows to fit the wrapped text, away from the tip (upwards for a bubble
+/// that sits above it).
+pub fn callout_layout(tip: Pt, a: Pt, b: Pt, text: &str, px: f32) -> BoxLayout {
     let pad = px * BOX_PAD_EM;
-    let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
-    let text_w = lines.iter().map(|l| line_px_width(l, px)).fold(px, f32::max);
-    let h = lines.len() as f32 * line_height(px);
+    let (min, max) = norm(a, b);
+    let min_w = px * 2.0 + 2.0 * pad;
+    let (x0, w) = if (b.x - a.x).abs() < 1.0 {
+        let longest = text.split('\n').map(|l| line_px_width(l, px)).fold(px, f32::max);
+        let w = (longest.min(px * CALLOUT_MAX_EM) + 2.0 * pad + 1.0).max(min_w);
+        (if a.x >= tip.x { a.x } else { a.x - w }, w)
+    } else {
+        (min.x, (max.x - min.x).max(min_w))
+    };
+    let text_w = w - 2.0 * pad;
+    let lines = wrap_text(text, px, text_w);
+    let need = lines.len() as f32 * line_height(px) + 2.0 * pad;
+    let h = (max.y - min.y).max(need);
+    let y0 = if (min.y + max.y) / 2.0 < tip.y { max.y - h } else { min.y };
     BoxLayout {
-        min: pos,
-        max: Pt::new(pos.x + text_w + 2.0 * pad, pos.y + h + 2.0 * pad),
-        text_pos: Pt::new(pos.x + pad, pos.y + pad),
+        min: Pt::new(x0, y0),
+        max: Pt::new(x0 + w, y0 + h),
+        text_pos: Pt::new(x0 + pad, y0 + pad),
         text_w,
         lines,
         radius: px * 0.45,
@@ -431,8 +449,8 @@ pub fn draw_text_shape(img: &mut Image, shape: &Shape, hide_text: bool) {
             paint_box(img, l.min, l.max, shape, &|x, y| sd_round_rect(x, y, lmin, lmax, r));
             (l.lines, l.text_pos)
         }
-        ShapeKind::Callout { tip, pos, text } => {
-            let l = callout_layout(*pos, text, px);
+        ShapeKind::Callout { tip, a, b, text } => {
+            let l = callout_layout(*tip, *a, *b, text, px);
             let tail = callout_tail(&l, *tip, px);
             let (lmin, lmax, r) = (l.min, l.max, l.radius);
             let sdf = |x: f32, y: f32| {
@@ -1056,7 +1074,12 @@ mod tests {
     fn callout_tail_reaches_tip() {
         let base = solid(300, 200, [0, 0, 0, 255]);
         let mut s = Shape::new(
-            ShapeKind::Callout { tip: Pt::new(40.0, 170.0), pos: Pt::new(120.0, 20.0), text: "Klik ini".into() },
+            ShapeKind::Callout {
+                tip: Pt::new(40.0, 170.0),
+                a: Pt::new(120.0, 150.0),
+                b: Pt::new(120.0, 150.0),
+                text: "Klik ini".into(),
+            },
             [255, 255, 255, 255],
             3.0,
         );
@@ -1065,13 +1088,48 @@ mod tests {
         d.add_shape(s.clone());
         let out = flatten(&base, &d);
         // near the tip, along the tail
-        assert!(out.pixel(46, 162)[0] > 128, "{:?}", out.pixel(46, 162));
+        assert!(out.pixel(60, 163)[0] > 128, "{:?}", out.pixel(60, 163));
         // far from both bubble and tail
         assert_eq!(out.pixel(250, 180), [0, 0, 0, 255]);
         let (min, max) = s.bounds();
         assert!(min.x <= 40.0 && max.y >= 170.0);
-        assert!(s.hit(Pt::new(60.0, 150.0), 2.0));
+        assert!(s.hit(Pt::new(60.0, 163.0), 2.0));
         assert!(!s.hit(Pt::new(250.0, 180.0), 2.0));
+    }
+
+    #[test]
+    fn callout_auto_width_extends_away_from_tip() {
+        let px = 18.0;
+        let tip = Pt::new(100.0, 100.0);
+        // corner right of the tip: grows right
+        let r = callout_layout(tip, Pt::new(120.0, 60.0), Pt::new(120.0, 60.0), "Halo", px);
+        assert_eq!(r.min.x, 120.0);
+        assert!(r.max.x > 120.0 + px);
+        // corner left of the tip: grows left, ends at the corner
+        let l = callout_layout(tip, Pt::new(80.0, 60.0), Pt::new(80.0, 60.0), "Halo", px);
+        assert!((l.max.x - 80.0).abs() < 1e-3);
+        // above the tip: grows upwards, bottom edge stays at the corner
+        assert!(l.min.y < 60.0 && (l.max.y - 60.0).abs() < 1e-3);
+        // below the tip: grows downwards
+        let d = callout_layout(tip, Pt::new(120.0, 140.0), Pt::new(120.0, 140.0), "Halo", px);
+        assert_eq!(d.min.y, 140.0);
+        assert!(d.max.y > 140.0);
+    }
+
+    #[test]
+    fn callout_wraps_long_text_at_16em_and_explicit_width_wraps() {
+        let px = 18.0;
+        let tip = Pt::new(0.0, 0.0);
+        let long = "kata ".repeat(40);
+        let auto = callout_layout(tip, Pt::new(50.0, 50.0), Pt::new(50.0, 50.0), &long, px);
+        assert!(auto.max.x - auto.min.x <= px * CALLOUT_MAX_EM + 2.0 * px * BOX_PAD_EM + 2.0);
+        assert!(auto.lines.len() > 1);
+        let one = callout_layout(tip, Pt::new(50.0, 50.0), Pt::new(50.0, 50.0), "hi", px);
+        assert_eq!(one.lines.len(), 1);
+        // explicit narrow box: wraps more, taller
+        let narrow = callout_layout(tip, Pt::new(50.0, 50.0), Pt::new(50.0 + px * 6.0, 60.0), &long, px);
+        assert!(narrow.lines.len() > auto.lines.len());
+        assert!((narrow.max.x - narrow.min.x - px * 6.0).abs() < 1e-3);
     }
 
     #[test]

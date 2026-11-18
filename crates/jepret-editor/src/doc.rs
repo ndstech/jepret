@@ -150,9 +150,10 @@ pub enum ShapeKind {
     /// area; the box grows downwards when the text needs more room.
     /// `fill` = solid box (text in a contrasting colour), else outline only.
     TextBox { a: Pt, b: Pt, text: String },
-    /// Speech bubble with its top-left corner at `pos` and a tail to `tip`.
-    /// The bubble sizes itself to the text.
-    Callout { tip: Pt, pos: Pt, text: String },
+    /// Speech bubble with a tail to `tip`. `a`/`b` = opposite corners of the
+    /// bubble box; text wraps inside it and the height grows (away from the
+    /// tip) to fit. A (near) zero-width box is auto-sized to the text.
+    Callout { tip: Pt, a: Pt, b: Pt, text: String },
     /// Numbered circle; radius = `width * 4`.
     Step { center: Pt, n: u32 },
     Pen { points: Vec<Pt> },
@@ -274,9 +275,10 @@ impl Shape {
                 mv(a);
                 mv(b);
             }
-            ShapeKind::Callout { tip, pos, .. } => {
+            ShapeKind::Callout { tip, a, b, .. } => {
                 mv(tip);
-                mv(pos);
+                mv(a);
+                mv(b);
             }
             ShapeKind::Step { center, .. } => mv(center),
             ShapeKind::Pen { points } | ShapeKind::Polygon { points } => points.iter_mut().for_each(mv),
@@ -302,9 +304,10 @@ impl Shape {
                 sc(b);
             }
             ShapeKind::Text { pos, .. } => sc(pos),
-            ShapeKind::Callout { tip, pos, .. } => {
+            ShapeKind::Callout { tip, a, b, .. } => {
                 sc(tip);
-                sc(pos);
+                sc(a);
+                sc(b);
             }
             ShapeKind::Step { center, .. } => sc(center),
             ShapeKind::Pen { points } | ShapeKind::Polygon { points } => points.iter_mut().for_each(sc),
@@ -333,8 +336,8 @@ impl Shape {
                 let l = crate::render::textbox_layout(*a, *b, text, self.text_px());
                 (l.min, l.max)
             }
-            ShapeKind::Callout { tip, pos, text } => {
-                let l = crate::render::callout_layout(*pos, text, self.text_px());
+            ShapeKind::Callout { tip, a, b, text } => {
+                let l = crate::render::callout_layout(*tip, *a, *b, text, self.text_px());
                 (
                     Pt::new(l.min.x.min(tip.x), l.min.y.min(tip.y)),
                     Pt::new(l.max.x.max(tip.x), l.max.y.max(tip.y)),
@@ -399,8 +402,8 @@ impl Shape {
                 let (min, max) = self.bounds();
                 p.x >= min.x - tol && p.x <= max.x + tol && p.y >= min.y - tol && p.y <= max.y + tol
             }
-            ShapeKind::Callout { tip, pos, text } => {
-                let l = crate::render::callout_layout(*pos, text, self.text_px());
+            ShapeKind::Callout { tip, a, b, text } => {
+                let l = crate::render::callout_layout(*tip, *a, *b, text, self.text_px());
                 let in_bubble =
                     p.x >= l.min.x - tol && p.x <= l.max.x + tol && p.y >= l.min.y - tol && p.y <= l.max.y + tol;
                 let c = Pt::new((l.min.x + l.max.x) / 2.0, (l.min.y + l.max.y) / 2.0);
@@ -414,6 +417,294 @@ impl Shape {
                     return points[0].dist(p) <= half;
                 }
                 points.windows(2).any(|w| seg_dist(p, w[0], w[1]) <= half)
+            }
+        }
+    }
+}
+
+
+// ---- resize handles ---------------------------------------------------------
+
+/// What a handle looks like / which cursor it wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandleKind {
+    Nw,
+    N,
+    Ne,
+    E,
+    Se,
+    S,
+    Sw,
+    W,
+    /// A free point (line end, polygon vertex).
+    Point,
+    /// Callout tail tip.
+    Tip,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Handle {
+    pub pos: Pt,
+    pub kind: HandleKind,
+}
+
+/// Smallest size (px) a shape can be resized to.
+pub const MIN_SIZE: f32 = 4.0;
+
+/// Box handle order: NW, N, NE, E, SE, S, SW, W as `(hx, hy)` in {-1, 0, 1}.
+const BOX_H: [(i8, i8); 8] = [(-1, -1), (0, -1), (1, -1), (1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0)];
+
+fn box_idx(hx: i8, hy: i8) -> usize {
+    BOX_H.iter().position(|h| *h == (hx, hy)).unwrap_or(0)
+}
+
+fn dir_kind(hx: i8, hy: i8) -> HandleKind {
+    match (hx, hy) {
+        (-1, -1) => HandleKind::Nw,
+        (0, -1) => HandleKind::N,
+        (1, -1) => HandleKind::Ne,
+        (1, 0) => HandleKind::E,
+        (1, 1) => HandleKind::Se,
+        (0, 1) => HandleKind::S,
+        (-1, 1) => HandleKind::Sw,
+        _ => HandleKind::W,
+    }
+}
+
+fn box_handles(min: Pt, max: Pt) -> Vec<Handle> {
+    let mid = Pt::new((min.x + max.x) / 2.0, (min.y + max.y) / 2.0);
+    let pick = |h: i8, lo: f32, m: f32, hi: f32| match h {
+        -1 => lo,
+        0 => m,
+        _ => hi,
+    };
+    BOX_H
+        .iter()
+        .map(|&(hx, hy)| Handle {
+            pos: Pt::new(pick(hx, min.x, mid.x, max.x), pick(hy, min.y, mid.y, max.y)),
+            kind: dir_kind(hx, hy),
+        })
+        .collect()
+}
+
+/// Move handle `idx` of the box `(min, max)` to `p`. Returns the new box
+/// (normalised) and the handle index that now follows the pointer (it flips
+/// when dragged across the opposite side). `min_w`/`min_h` bound the size.
+fn drag_box(min: Pt, max: Pt, idx: usize, p: Pt, keep_aspect: bool, min_w: f32, min_h: f32) -> (Pt, Pt, usize) {
+    let (hx, hy) = BOX_H.get(idx).copied().unwrap_or((1, 1));
+    let (w0, h0) = (max.x - min.x, max.y - min.y);
+    // fixed edge per axis and where the moving edge wants to go
+    let axis = |h: i8, lo: f32, hi: f32, want: f32, minimum: f32| -> (f32, f32, i8) {
+        if h == 0 {
+            return (lo, hi, 0);
+        }
+        let fixed = if h < 0 { hi } else { lo };
+        let sign = if want > fixed {
+            1.0
+        } else if want < fixed {
+            -1.0
+        } else {
+            h as f32
+        };
+        let moved = fixed + sign * (want - fixed).abs().max(minimum);
+        let (a, b) = if moved < fixed { (moved, fixed) } else { (fixed, moved) };
+        (a, b, if sign > 0.0 { 1 } else { -1 })
+    };
+    let (mut x0, mut x1, mut nhx) = axis(hx, min.x, max.x, p.x, min_w);
+    let (mut y0, mut y1, mut nhy) = axis(hy, min.y, max.y, p.y, min_h);
+    if keep_aspect && hx != 0 && hy != 0 && w0 > f32::EPSILON && h0 > f32::EPSILON {
+        let s = ((x1 - x0) / w0).max((y1 - y0) / h0);
+        let (w, h) = (w0 * s, h0 * s);
+        let fx = if hx < 0 { max.x } else { min.x };
+        let fy = if hy < 0 { max.y } else { min.y };
+        (x0, x1) = if nhx > 0 { (fx, fx + w) } else { (fx - w, fx) };
+        (y0, y1) = if nhy > 0 { (fy, fy + h) } else { (fy - h, fy) };
+    }
+    if hx == 0 {
+        nhx = 0;
+    }
+    if hy == 0 {
+        nhy = 0;
+    }
+    (Pt::new(x0, y0), Pt::new(x1, y1), box_idx(nhx, nhy))
+}
+
+impl Shape {
+    /// The box a box-like shape (rect, text box, callout bubble...) occupies.
+    fn box_rect(&self) -> Option<(Pt, Pt)> {
+        match &self.kind {
+            ShapeKind::Rect { .. }
+            | ShapeKind::Ellipse { .. }
+            | ShapeKind::Highlight { .. }
+            | ShapeKind::Blur { .. }
+            | ShapeKind::Pixelate { .. }
+            | ShapeKind::TextBox { .. } => Some(self.bounds()),
+            ShapeKind::Callout { tip, a, b, text } => {
+                let l = crate::render::callout_layout(*tip, *a, *b, text, self.text_px());
+                Some((l.min, l.max))
+            }
+            _ => None,
+        }
+    }
+
+    /// Minimum `(w, h)` for resizable boxes.
+    fn min_box(&self) -> (f32, f32) {
+        match &self.kind {
+            ShapeKind::TextBox { .. } | ShapeKind::Callout { .. } => {
+                let px = self.text_px();
+                (px * 2.0 + px * crate::render::BOX_PAD_EM * 2.0, MIN_SIZE)
+            }
+            _ => (MIN_SIZE, MIN_SIZE),
+        }
+    }
+
+    /// Resize handles of the shape (image px). Empty when it has none.
+    /// Indices are what [`drag_handle`](Self::drag_handle) takes.
+    pub fn handles(&self) -> Vec<Handle> {
+        match &self.kind {
+            ShapeKind::Arrow { a, b } | ShapeKind::Line { a, b } => vec![
+                Handle { pos: *a, kind: HandleKind::Point },
+                Handle { pos: *b, kind: HandleKind::Point },
+            ],
+            ShapeKind::Rect { .. }
+            | ShapeKind::Ellipse { .. }
+            | ShapeKind::Highlight { .. }
+            | ShapeKind::Blur { .. }
+            | ShapeKind::Pixelate { .. }
+            | ShapeKind::TextBox { .. } => {
+                let (min, max) = self.bounds();
+                box_handles(min, max)
+            }
+            ShapeKind::Callout { tip, .. } => {
+                let mut v = self.box_rect().map(|(min, max)| box_handles(min, max)).unwrap_or_default();
+                v.push(Handle { pos: *tip, kind: HandleKind::Tip });
+                v
+            }
+            ShapeKind::Text { .. } => {
+                let (_, max) = self.bounds();
+                vec![Handle { pos: max, kind: HandleKind::Se }]
+            }
+            ShapeKind::Step { center, .. } => {
+                vec![Handle { pos: Pt::new(center.x + self.step_radius(), center.y), kind: HandleKind::E }]
+            }
+            ShapeKind::Pen { points } if !points.is_empty() => {
+                let (min, max) = self.bounds();
+                vec![
+                    Handle { pos: min, kind: HandleKind::Nw },
+                    Handle { pos: Pt::new(max.x, min.y), kind: HandleKind::Ne },
+                    Handle { pos: max, kind: HandleKind::Se },
+                    Handle { pos: Pt::new(min.x, max.y), kind: HandleKind::Sw },
+                ]
+            }
+            ShapeKind::Pen { .. } => Vec::new(),
+            ShapeKind::Polygon { points } => {
+                points.iter().map(|p| Handle { pos: *p, kind: HandleKind::Point }).collect()
+            }
+        }
+    }
+
+    /// Drag handle `idx` (from [`handles`](Self::handles)) to `p`.
+    /// `keep_aspect` (Shift): 45 degree snap for lines, aspect ratio for box
+    /// corners and pen. Returns the index of the handle that now follows the
+    /// pointer (it changes when a box/pen is dragged across its opposite side).
+    pub fn drag_handle(&mut self, idx: usize, p: Pt, keep_aspect: bool) -> usize {
+        let (min_w, min_h) = self.min_box();
+        let box_rect = self.box_rect();
+        let width = self.width;
+        let text_bounds = self.bounds();
+        match &mut self.kind {
+            ShapeKind::Arrow { a, b } | ShapeKind::Line { a, b } => {
+                let (fixed, moving) = if idx == 0 { (*b, &mut *a) } else { (*a, &mut *b) };
+                let (_, np) =
+                    crate::session::constrain_drag(crate::session::DragKind::Segment, fixed, p, keep_aspect, false);
+                *moving = np;
+                idx
+            }
+            ShapeKind::Rect { a, b }
+            | ShapeKind::Ellipse { a, b }
+            | ShapeKind::Highlight { a, b }
+            | ShapeKind::Blur { a, b }
+            | ShapeKind::Pixelate { a, b }
+            | ShapeKind::TextBox { a, b, .. } => {
+                let Some((min, max)) = box_rect else { return idx };
+                let (nmin, nmax, ni) = drag_box(min, max, idx, p, keep_aspect, min_w, min_h);
+                (*a, *b) = (nmin, nmax);
+                ni
+            }
+            ShapeKind::Callout { tip, a, b, .. } => {
+                if idx >= 8 {
+                    *tip = p;
+                    return idx;
+                }
+                let Some((min, max)) = box_rect else { return idx };
+                let (nmin, nmax, ni) = drag_box(min, max, idx, p, keep_aspect, min_w, min_h);
+                (*a, *b) = (nmin, nmax);
+                ni
+            }
+            ShapeKind::Text { .. } => {
+                let (min, max) = text_bounds;
+                let (w, h) = (max.x - min.x, max.y - min.y);
+                if w > f32::EPSILON && h > f32::EPSILON {
+                    let s = ((p.x - min.x) / w + (p.y - min.y) / h) / 2.0;
+                    self.width = (width * s).max(1.0);
+                }
+                idx
+            }
+            ShapeKind::Step { center, .. } => {
+                self.width = (center.dist(p) / STEP_RADIUS_PER_WIDTH).max(6.0 / STEP_RADIUS_PER_WIDTH);
+                idx
+            }
+            ShapeKind::Pen { points } => {
+                if points.is_empty() {
+                    return idx;
+                }
+                let (min, max) = text_bounds;
+                // corners: 0 NW, 1 NE, 2 SE, 3 SW
+                let (hx, hy): (i8, i8) = match idx {
+                    0 => (-1, -1),
+                    1 => (1, -1),
+                    2 => (1, 1),
+                    _ => (-1, 1),
+                };
+                let fixed = Pt::new(if hx < 0 { max.x } else { min.x }, if hy < 0 { max.y } else { min.y });
+                let held = Pt::new(if hx < 0 { min.x } else { max.x }, if hy < 0 { min.y } else { max.y });
+                let scale_of = |want: f32, fixed: f32, held: f32| -> f32 {
+                    let ext = held - fixed;
+                    if ext.abs() < MIN_SIZE {
+                        return 1.0;
+                    }
+                    let s = (want - fixed) / ext;
+                    let floor = MIN_SIZE / ext.abs();
+                    if s.abs() < floor {
+                        floor * if s < 0.0 { -1.0 } else { 1.0 }
+                    } else {
+                        s
+                    }
+                };
+                let (mut sx, mut sy) = (scale_of(p.x, fixed.x, held.x), scale_of(p.y, fixed.y, held.y));
+                if keep_aspect {
+                    let s = sx.abs().max(sy.abs());
+                    sx = s * if sx < 0.0 { -1.0 } else { 1.0 };
+                    sy = s * if sy < 0.0 { -1.0 } else { 1.0 };
+                }
+                for q in points.iter_mut() {
+                    q.x = fixed.x + (q.x - fixed.x) * sx;
+                    q.y = fixed.y + (q.y - fixed.y) * sy;
+                }
+                let nhx = if sx < 0.0 { -hx } else { hx };
+                let nhy = if sy < 0.0 { -hy } else { hy };
+                match (nhx, nhy) {
+                    (-1, -1) => 0,
+                    (1, -1) => 1,
+                    (1, 1) => 2,
+                    _ => 3,
+                }
+            }
+            ShapeKind::Polygon { points } => {
+                if let Some(q) = points.get_mut(idx) {
+                    *q = p;
+                }
+                idx
             }
         }
     }
@@ -968,5 +1259,190 @@ mod tests {
             2.0,
         );
         assert!(pen.hit(Pt::new(5.0, 5.0), 1.0));
+    }
+
+    // ---- handles ----
+
+    fn pt(x: f32, y: f32) -> Pt {
+        Pt::new(x, y)
+    }
+
+    fn mk(kind: ShapeKind) -> Shape {
+        Shape::new(kind, [0, 0, 0, 255], 3.0)
+    }
+
+    #[test]
+    fn line_handles_move_endpoint_and_snap() {
+        let mut s = mk(ShapeKind::Line { a: pt(0.0, 0.0), b: pt(10.0, 0.0) });
+        assert_eq!(s.handles().len(), 2);
+        s.drag_handle(1, pt(50.0, 7.0), false);
+        assert_eq!(s.kind, ShapeKind::Line { a: pt(0.0, 0.0), b: pt(50.0, 7.0) });
+        s.drag_handle(1, pt(50.0, 7.0), true);
+        if let ShapeKind::Line { a, b } = s.kind {
+            assert_eq!(a, pt(0.0, 0.0));
+            assert!(b.y.abs() < 1e-3 && b.x > 49.0);
+        }
+        s.drag_handle(0, pt(-5.0, -5.0), false);
+        if let ShapeKind::Line { a, .. } = s.kind {
+            assert_eq!(a, pt(-5.0, -5.0));
+        }
+    }
+
+    #[test]
+    fn rect_corner_and_edge_resize() {
+        let mut s = rect(10.0, 10.0, 50.0, 30.0);
+        let h = s.handles();
+        assert_eq!(h.len(), 8);
+        assert_eq!(h[0].kind, HandleKind::Nw);
+        assert_eq!(h[0].pos, pt(10.0, 10.0));
+        assert_eq!(h[4].pos, pt(50.0, 30.0));
+        assert_eq!(h[1].pos, pt(30.0, 10.0));
+        // SE corner
+        assert_eq!(s.drag_handle(4, pt(80.0, 60.0), false), 4);
+        assert_eq!(s.bounds(), (pt(10.0, 10.0), pt(80.0, 60.0)));
+        // E edge only changes x
+        s.drag_handle(3, pt(100.0, 999.0), false);
+        assert_eq!(s.bounds(), (pt(10.0, 10.0), pt(100.0, 60.0)));
+        // N edge only changes y
+        s.drag_handle(1, pt(-9.0, 20.0), false);
+        assert_eq!(s.bounds(), (pt(10.0, 20.0), pt(100.0, 60.0)));
+    }
+
+    #[test]
+    fn rect_flip_and_min_size() {
+        let mut s = rect(10.0, 10.0, 50.0, 30.0);
+        // drag E handle past the west edge: flips to the W handle
+        let ni = s.drag_handle(3, pt(0.0, 20.0), false);
+        assert_eq!(ni, 7);
+        assert_eq!(s.bounds(), (pt(0.0, 10.0), pt(10.0, 30.0)));
+        // keep dragging with the new index: stays consistent
+        s.drag_handle(ni, pt(-20.0, 20.0), false);
+        assert_eq!(s.bounds(), (pt(-20.0, 10.0), pt(10.0, 30.0)));
+        // collapse is prevented
+        let mut s = rect(10.0, 10.0, 50.0, 30.0);
+        s.drag_handle(4, pt(10.5, 10.5), false);
+        let (min, max) = s.bounds();
+        assert!(max.x - min.x >= MIN_SIZE && max.y - min.y >= MIN_SIZE);
+    }
+
+    #[test]
+    fn rect_corner_keeps_aspect_with_shift() {
+        let mut s = rect(0.0, 0.0, 40.0, 20.0);
+        s.drag_handle(4, pt(100.0, 30.0), true);
+        let (min, max) = s.bounds();
+        assert!(((max.x - min.x) / (max.y - min.y) - 2.0).abs() < 1e-3, "{min:?} {max:?}");
+        assert_eq!(min, pt(0.0, 0.0));
+        // flipped corner with aspect: dragged to the NW of the fixed corner
+        let mut s = rect(0.0, 0.0, 40.0, 20.0);
+        let ni = s.drag_handle(4, pt(-40.0, -10.0), true);
+        assert_eq!(ni, 0);
+        let (min, max) = s.bounds();
+        assert!(((max.x - min.x) / (max.y - min.y) - 2.0).abs() < 1e-3);
+        assert_eq!(max, pt(0.0, 0.0));
+    }
+
+    #[test]
+    fn ellipse_highlight_blur_pixelate_have_eight_handles() {
+        for k in [
+            ShapeKind::Ellipse { a: pt(0.0, 0.0), b: pt(10.0, 10.0) },
+            ShapeKind::Highlight { a: pt(0.0, 0.0), b: pt(10.0, 10.0) },
+            ShapeKind::Blur { a: pt(0.0, 0.0), b: pt(10.0, 10.0) },
+            ShapeKind::Pixelate { a: pt(0.0, 0.0), b: pt(10.0, 10.0) },
+        ] {
+            let mut s = mk(k);
+            assert_eq!(s.handles().len(), 8);
+            s.drag_handle(2, pt(30.0, -20.0), false);
+            assert_eq!(s.bounds(), (pt(0.0, -20.0), pt(30.0, 10.0)));
+        }
+    }
+
+    #[test]
+    fn textbox_resize_has_min_width() {
+        let mut s = mk(ShapeKind::TextBox { a: pt(0.0, 0.0), b: pt(200.0, 30.0), text: "hello".into() });
+        assert_eq!(s.handles().len(), 8);
+        s.drag_handle(3, pt(2.0, 10.0), false);
+        let (min, max) = s.bounds();
+        assert!(max.x - min.x >= s.text_px() * 2.0, "{}", max.x - min.x);
+        // handles sit on the (grown) layout box
+        let h = s.handles();
+        assert_eq!(h[4].pos, max);
+    }
+
+    #[test]
+    fn text_handle_scales_font() {
+        let mut s = mk(ShapeKind::Text { pos: pt(10.0, 10.0), text: "Hello".into() });
+        let h = s.handles();
+        assert_eq!(h.len(), 1);
+        let (min, max) = s.bounds();
+        assert_eq!(h[0].pos, max);
+        let (w, hh) = (max.x - min.x, max.y - min.y);
+        s.drag_handle(0, pt(min.x + 2.0 * w, min.y + 2.0 * hh), false);
+        assert!((s.width - 6.0).abs() < 0.1, "{}", s.width);
+        s.drag_handle(0, pt(min.x + 1.0, min.y + 1.0), false);
+        assert!(s.width >= 1.0);
+    }
+
+    #[test]
+    fn step_handle_changes_radius() {
+        let mut s = mk(ShapeKind::Step { center: pt(50.0, 50.0), n: 1 });
+        let h = s.handles();
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].pos, pt(50.0 + s.step_radius(), 50.0));
+        s.drag_handle(0, pt(50.0, 90.0), false);
+        assert!((s.step_radius() - 40.0).abs() < 1e-3);
+        s.drag_handle(0, pt(50.0, 50.0), false);
+        assert!(s.step_radius() >= 6.0);
+    }
+
+    #[test]
+    fn pen_corners_scale_points() {
+        let mut s = mk(ShapeKind::Pen { points: vec![pt(0.0, 0.0), pt(10.0, 20.0), pt(20.0, 10.0)] });
+        let h = s.handles();
+        assert_eq!(h.len(), 4);
+        assert_eq!(h[2].pos, pt(20.0, 20.0));
+        // SE x2
+        assert_eq!(s.drag_handle(2, pt(40.0, 40.0), false), 2);
+        assert_eq!(s.kind, ShapeKind::Pen { points: vec![pt(0.0, 0.0), pt(20.0, 40.0), pt(40.0, 20.0)] });
+        // dragging NW across the SE corner flips the handle index
+        let ni = s.drag_handle(0, pt(50.0, 50.0), false);
+        assert_eq!(ni, 2);
+        let (min, max) = s.bounds();
+        assert!(max.x - min.x >= MIN_SIZE - 1e-3);
+    }
+
+    #[test]
+    fn polygon_vertices_are_handles() {
+        let mut s = mk(ShapeKind::Polygon { points: vec![pt(0.0, 0.0), pt(10.0, 0.0), pt(5.0, 9.0)] });
+        assert_eq!(s.handles().len(), 3);
+        assert!(s.handles().iter().all(|h| h.kind == HandleKind::Point));
+        s.drag_handle(2, pt(6.0, 20.0), false);
+        assert_eq!(s.kind, ShapeKind::Polygon { points: vec![pt(0.0, 0.0), pt(10.0, 0.0), pt(6.0, 20.0)] });
+        // out-of-range index is harmless
+        s.drag_handle(9, pt(1.0, 1.0), false);
+    }
+
+    #[test]
+    fn callout_box_and_tip_handles() {
+        let mut s = mk(ShapeKind::Callout {
+            tip: pt(0.0, 100.0),
+            a: pt(40.0, 60.0),
+            b: pt(240.0, 20.0),
+            text: "Klik".into(),
+        });
+        let h = s.handles();
+        assert_eq!(h.len(), 9);
+        assert_eq!(h[8].kind, HandleKind::Tip);
+        assert_eq!(h[8].pos, pt(0.0, 100.0));
+        // tip moves freely
+        assert_eq!(s.drag_handle(8, pt(-30.0, 120.0), false), 8);
+        if let ShapeKind::Callout { tip, .. } = &s.kind {
+            assert_eq!(*tip, pt(-30.0, 120.0));
+        }
+        // widen the box through the E handle
+        let h = s.handles();
+        s.drag_handle(3, pt(h[3].pos.x + 50.0, 40.0), false);
+        let hh = s.handles();
+        assert!((hh[3].pos.x - (h[3].pos.x + 50.0)).abs() < 1e-3);
+        assert!((hh[7].pos.x - h[7].pos.x).abs() < 1e-3);
     }
 }
