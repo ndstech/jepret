@@ -430,10 +430,52 @@ pub fn constrain_drag(kind: DragKind, start: Pt, p: Pt, shift: bool, alt: bool) 
     }
 }
 
+/// Snap `p` so the segment from `from` is a multiple of 45 degrees.
+pub fn snap_45(from: Pt, p: Pt) -> Pt {
+    constrain_drag(DragKind::Segment, from, p, true, false).1
+}
+
+/// Is `p` within `radius` of the first vertex of a draft with >= 3 points
+/// (i.e. clicking it closes the polygon)?
+pub fn near_first_vertex(draft: &[Pt], p: Pt, radius: f32) -> bool {
+    draft.len() >= 3 && draft[0].dist(p) <= radius
+}
+
+/// Finish a polygon draft: drop consecutive duplicate points (a double-click
+/// adds the same vertex twice). `None` when fewer than 3 distinct points remain.
+pub fn finalize_polygon(draft: &[Pt]) -> Option<Vec<Pt>> {
+    let mut out: Vec<Pt> = Vec::with_capacity(draft.len());
+    for &p in draft {
+        if out.last().is_none_or(|q| q.dist(p) > 0.5) {
+            out.push(p);
+        }
+    }
+    if out.len() > 1 && out[0].dist(out[out.len() - 1]) <= 0.5 {
+        out.pop();
+    }
+    (out.len() >= 3).then_some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use jepret_core::shortcuts::EDITOR_SHORTCUTS;
+
+    #[test]
+    fn polygon_helpers() {
+        let o = Pt::new(0.0, 0.0);
+        let s = snap_45(o, Pt::new(10.0, 1.0));
+        assert!(s.y.abs() < 1e-3 && s.x > 9.0);
+        let d = vec![o, Pt::new(10.0, 0.0), Pt::new(10.0, 10.0)];
+        assert!(near_first_vertex(&d, Pt::new(3.0, 3.0), 5.0));
+        assert!(!near_first_vertex(&d, Pt::new(30.0, 3.0), 5.0));
+        assert!(!near_first_vertex(&d[..2], o, 5.0));
+        let mut dup = d.clone();
+        dup.push(Pt::new(10.0, 10.0));
+        assert_eq!(finalize_polygon(&dup).unwrap().len(), 3);
+        assert!(finalize_polygon(&d[..2]).is_none());
+        assert!(finalize_polygon(&[o, o, o]).is_none());
+    }
 
     fn sess() -> Session {
         Session::new(&EditorConfig::default())

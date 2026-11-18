@@ -407,8 +407,16 @@ impl Shape {
                 in_bubble || seg_dist(p, *tip, c) <= self.text_px() * 0.4 + tol
             }
             ShapeKind::Step { center, .. } => center.dist(p) <= self.step_radius() + tol,
-            // TODO(polygon): agent P implements edge/inside hit test.
-            ShapeKind::Polygon { .. } => false,
+            ShapeKind::Polygon { points } => {
+                if points.len() < 2 {
+                    return points.first().is_some_and(|q| q.dist(p) <= half);
+                }
+                if points.len() == 2 {
+                    return seg_dist(p, points[0], points[1]) <= half;
+                }
+                let sd = crate::render::sd_polygon(p, points);
+                if self.fill { sd <= tol } else { sd.abs() <= half }
+            }
             ShapeKind::Pen { points } => {
                 if points.len() == 1 {
                     return points[0].dist(p) <= half;
@@ -751,6 +759,18 @@ mod tests {
             [255, 0, 0, 255],
             2.0,
         )
+    }
+
+    #[test]
+    fn polygon_hit_edge_and_fill() {
+        let pts = vec![Pt::new(0.0, 0.0), Pt::new(20.0, 0.0), Pt::new(20.0, 40.0), Pt::new(60.0, 40.0), Pt::new(60.0, 60.0), Pt::new(0.0, 60.0)];
+        let mut s = Shape::new(ShapeKind::Polygon { points: pts }, [0, 0, 0, 255], 2.0);
+        assert!(s.hit(Pt::new(0.0, 30.0), 3.0)); // on edge
+        assert!(!s.hit(Pt::new(10.0, 20.0), 3.0)); // inside, hollow
+        s.fill = true;
+        assert!(s.hit(Pt::new(10.0, 20.0), 3.0));
+        assert!(!s.hit(Pt::new(40.0, 10.0), 3.0)); // concave notch
+        assert!(!s.hit(Pt::new(-30.0, 30.0), 3.0));
     }
 
     #[test]
