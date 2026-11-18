@@ -260,6 +260,14 @@ impl Session {
         self.sel.clear();
     }
 
+    /// Jump to history state `idx` (see [`Document::jump_to`]); the selection
+    /// is cleared like on undo/redo.
+    pub fn jump_history(&mut self, idx: usize) {
+        if self.doc.jump_to(idx) {
+            self.sel.clear();
+        }
+    }
+
     /// Move the object at doc index `from` to `to` (one undo step), keeping
     /// the selection on the same objects.
     pub fn move_object(&mut self, from: usize, to: usize) {

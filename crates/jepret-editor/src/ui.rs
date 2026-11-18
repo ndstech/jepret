@@ -130,8 +130,8 @@ pub struct EditorApp {
     /// Handle-resize gesture in progress.
     resizing: Option<Resize>,
     prop_editing: bool,
-    /// Sidebar panel open state: PROPERTI, OBJEK, NAVIGATOR (session only).
-    panels_open: [bool; 3],
+    /// Sidebar panel open state: PROPERTI, OBJEK, RIWAYAT, NAVIGATOR (session only).
+    panels_open: [bool; 4],
     /// Object under the pointer in the OBJEK list (highlighted on the canvas).
     hover_obj: Option<usize>,
     /// Doc index of the list row being dragged to reorder.
@@ -142,6 +142,12 @@ pub struct EditorApp {
     fit_pending: bool,
     /// View right after the last fit; while unchanged, a resized window refits.
     fitted: Option<(f32, Vec2)>,
+    /// Image region shown at the last frame; a change (crop applied / reset / undone) refits.
+    last_vis: Option<(f32, f32, f32, f32)>,
+    /// Last click in the OBJEK list (row, time, pointer) for double-click detection.
+    list_click: Option<(usize, Instant, Pos2)>,
+    /// (position, length) of the history at the last frame, to auto-scroll RIWAYAT.
+    hist_seen: (usize, usize),
     canvas_rect: ERect,
     /// Pointer offset inside a scrollbar thumb while it is dragged.
     scroll_grab: f32,
@@ -196,13 +202,16 @@ impl EditorApp {
             frames: 0,
             resizing: None,
             prop_editing: false,
-            panels_open: [true; 3],
+            panels_open: [true; 4],
             hover_obj: None,
             obj_drag: None,
             zoom: 1.0,
             pan: Vec2::ZERO,
             fit_pending: true,
             fitted: None,
+            last_vis: None,
+            list_click: None,
+            hist_seen: (usize::MAX, 0),
             canvas_rect: ERect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0)),
             scroll_grab: 0.0,
             crop_before: None,
@@ -563,6 +572,21 @@ impl EditorApp {
         if self.s.tool != Tool::Crop {
             self.crop_before = None;
         }
+        // Enter / F2 edits the single selected text object (instead of "Copy & tutup").
+        if self.s.tool != Tool::Crop && self.poly_draft.is_none() && !self.confirm_close && !self.show_help {
+            let target = match self.s.selection() {
+                [i] if self.s.doc.shapes().get(*i).is_some_and(|s| s.kind.is_text()) => Some(*i),
+                _ => None,
+            };
+            if let Some(i) = target {
+                let hit = ctx.input_mut(|inp| {
+                    inp.consume_key(Modifiers::NONE, Key::Enter) | inp.consume_key(Modifiers::NONE, Key::F2)
+                });
+                if hit {
+                    self.edit_text_shape(i);
+                }
+            }
+        }
         let events = ctx.input(|i| i.events.clone());
         let mods = ctx.input(|i| i.modifiers);
         let mut combos: Vec<(KeyCombo, bool)> = Vec::new();
@@ -852,9 +876,11 @@ impl EditorApp {
                     let top = ui.cursor().top();
                     self.properties_panel(ui, ctx, total * 0.6);
                     let used = ui.cursor().top() - top;
-                    let nav_h = HEAD_H + 1.0 + if self.panels_open[2] { NAV_BODY_H } else { 0.0 };
-                    let obj_h = (total - used - nav_h).max(OBJ_MIN_H);
+                    let nav_h = HEAD_H + 1.0 + if self.panels_open[3] { NAV_BODY_H } else { 0.0 };
+                    let hist_h = HEAD_H + 1.0 + if self.panels_open[2] { HIST_BODY_H } else { 0.0 };
+                    let obj_h = (total - used - nav_h - hist_h).max(OBJ_MIN_H);
                     self.objects_panel(ui, ctx, obj_h);
+                    self.history_panel(ui);
                     self.navigator_panel(ui, ctx);
                 });
             });
@@ -1077,7 +1103,7 @@ impl EditorApp {
             egui::Frame::none().inner_margin(egui::Margin::symmetric(SP_3, 6.0)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(
-                    egui::RichText::new("Ctrl+klik pilih banyak \u{b7} drag untuk urutan \u{b7} dobel-klik teks = edit")
+                    egui::RichText::new("Ctrl+klik pilih banyak \u{b7} drag = urutan \u{b7} dobel-klik / Enter = edit teks")
                         .size(11.0)
                         .color(pal.muted),
                 );
@@ -1148,9 +1174,6 @@ impl EditorApp {
                 if resp.clicked() {
                     click = Some(i);
                 }
-                if resp.double_clicked() {
-                    dbl = Some(i);
-                }
                 if resp.drag_started() {
                     started = Some(i);
                 }
@@ -1207,6 +1230,18 @@ impl EditorApp {
             self.obj_drag = None;
         }
         if let Some(i) = click {
+            // Selecting can reflow the sidebar (PROPERTI changes height), moving
+            // rows under the pointer between the two clicks, so egui's own
+            // double-click is unreliable here: pair clicks by row, time and place.
+            let now = Instant::now();
+            let at = ptr.unwrap_or(Pos2::ZERO);
+            let prev = self.list_click.take();
+            match prev {
+                Some((pi, t, pp)) if now.duration_since(t).as_millis() < 500 && pp.distance(at) < 8.0 => {
+                    dbl = Some(pi);
+                }
+                _ => self.list_click = Some((i, now, at)),
+            }
             self.commit_text();
             let sel = session::click_select(self.s.selection(), i, mods.ctrl || mods.command, mods.shift);
             self.s.set_selection(sel);
@@ -1219,16 +1254,85 @@ impl EditorApp {
         }
     }
 
+    /// RIWAYAT: every document state (original, undo steps, then redo steps
+    /// greyed out); clicking a row jumps straight to that state.
+    fn history_panel(&mut self, ui: &mut egui::Ui) {
+        let pal = self.pal;
+        self.side_sep(ui);
+        let pos = self.s.doc.history_pos();
+        let len = self.s.doc.history_len();
+        let (_, clicked) = panel_header(ui, &pal, self.panels_open[2], "Riwayat", &format!("{} langkah", len - 1), 0.0);
+        if clicked {
+            self.panels_open[2] = !self.panels_open[2];
+        }
+        if !self.panels_open[2] {
+            return;
+        }
+        self.side_sep(ui);
+        let labels = self.s.doc.history_labels();
+        let follow = self.hist_seen != (pos, len);
+        self.hist_seen = (pos, len);
+        let mut jump: Option<usize> = None;
+        egui::ScrollArea::vertical().id_salt("hist_list").max_height(HIST_BODY_H).auto_shrink([false, false]).show(ui, |ui| {
+            for (i, label) in labels.iter().enumerate() {
+                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+                if !ui.is_rect_visible(rect) && !(follow && i == pos) {
+                    continue;
+                }
+                let current = i == pos;
+                let future = i > pos;
+                if current {
+                    ui.painter().rect_filled(rect, 0.0, pal.accent_soft);
+                    if follow {
+                        ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                    }
+                } else if resp.hovered() {
+                    ui.painter().rect_filled(rect, 0.0, pal.raised);
+                }
+                let fg = if current {
+                    pal.accent
+                } else if future {
+                    pal.muted
+                } else {
+                    pal.text
+                };
+                let cy = rect.center().y;
+                ui.painter().text(
+                    pos2(rect.left() + SP_3, cy),
+                    Align2::LEFT_CENTER,
+                    format!("{i}"),
+                    FontId::monospace(10.0),
+                    pal.line_strong,
+                );
+                ui.painter().with_clip_rect(rect).text(
+                    pos2(rect.left() + 36.0, cy),
+                    Align2::LEFT_CENTER,
+                    label,
+                    FontId::proportional(TEXT_BODY),
+                    fg,
+                );
+                if resp.clicked() && !current {
+                    jump = Some(i);
+                }
+            }
+        });
+        if let Some(i) = jump {
+            self.commit_text();
+            self.s.jump_history(i);
+            self.drawing = None;
+        }
+    }
+
     /// NAVIGATOR: thumbnail with the visible area; click/drag pans the view.
     fn navigator_panel(&mut self, ui: &mut egui::Ui, ctx: &Context) {
         let pal = self.pal;
         self.side_sep(ui);
         let zoom_txt = format!("{:.0}%", self.zoom * ctx.pixels_per_point() * 100.0);
-        let (_, clicked) = panel_header(ui, &pal, self.panels_open[2], "Navigator", &zoom_txt, 0.0);
+        let (_, clicked) = panel_header(ui, &pal, self.panels_open[3], "Navigator", &zoom_txt, 0.0);
         if clicked {
-            self.panels_open[2] = !self.panels_open[2];
+            self.panels_open[3] = !self.panels_open[3];
         }
-        if !self.panels_open[2] {
+        if !self.panels_open[3] {
             return;
         }
         let w = ui.available_width();
@@ -1239,14 +1343,16 @@ impl EditorApp {
         );
         ui.painter().rect(boxr, RADIUS_CONTROL, pal.canvas, Stroke::new(1.0_f32, pal.line));
         let (Some(base), Some(tex)) = (self.base.clone(), self.tex.clone()) else { return };
-        let (iw, ih) = (base.width as f32, base.height as f32);
+        let (full_w, full_h) = (base.width as f32, base.height as f32);
+        let (vx, vy, iw, ih) = view::visible_rect(full_w, full_h, self.s.doc.crop(), self.s.tool == Tool::Crop);
         let (nw, nh) = view::navigator_size(iw, ih, boxr.width() - 16.0, boxr.height() - 16.0);
         if nw <= 0.0 {
             return;
         }
         let nav = ERect::from_center_size(boxr.center(), vec2(nw, nh));
         let painter = ui.painter();
-        painter.image(tex.id(), nav, ERect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        let uv = ERect::from_min_max(pos2(vx / full_w, vy / full_h), pos2((vx + iw) / full_w, (vy + ih) / full_h));
+        painter.image(tex.id(), nav, uv, Color32::WHITE);
         let zoom = self.zoom;
         let view_size = self.canvas_rect.size();
         let k = nav.width() / iw.max(1.0) / zoom;
@@ -1546,6 +1652,13 @@ impl EditorApp {
                     return;
                 };
                 let (iw, ih) = (base.width as f32, base.height as f32);
+                // With a crop (and not in the Crop tool) only that region is the canvas content.
+                let vis = view::visible_rect(iw, ih, self.s.doc.crop(), self.s.tool == Tool::Crop);
+                let (vx, vy, vw, vh) = vis;
+                if self.last_vis != Some(vis) {
+                    self.last_vis = Some(vis);
+                    self.fit_pending = true;
+                }
                 let avail = ui.available_size();
                 let (resp, painter) = ui.allocate_painter(avail, Sense::click_and_drag());
                 let rect = resp.rect;
@@ -1556,11 +1669,11 @@ impl EditorApp {
                 }
                 self.canvas_rect = rect.translate(-rect.min.to_vec2());
                 if self.fit_pending && rect.width() > 10.0 {
-                    let z = ((rect.width() - 24.0) / iw)
-                        .min((rect.height() - 24.0) / ih)
+                    let z = ((rect.width() - 24.0) / vw)
+                        .min((rect.height() - 24.0) / vh)
                         .min(1.0 / ctx.pixels_per_point());
                     self.zoom = z.max(0.01);
-                    self.pan = vec2(((rect.width() - iw * self.zoom) / 2.0).round(), ((rect.height() - ih * self.zoom) / 2.0).round());
+                    self.pan = vec2(((rect.width() - vw * self.zoom) / 2.0).round(), ((rect.height() - vh * self.zoom) / 2.0).round());
                     self.fitted = Some((self.zoom, self.pan));
                     self.fit_pending = false;
                 }
@@ -1592,16 +1705,19 @@ impl EditorApp {
                 }
 
                 // Scrollbars appear once the image outgrows the view.
-                let ov = Overlays::layout(rect, iw, ih, self.zoom);
-                let over_overlay = self.overlay_input(ui, &ov, iw, ih);
-                let (cw, ch) = (iw * self.zoom, ih * self.zoom);
+                let ov = Overlays::layout(rect, vw, vh, self.zoom);
+                let over_overlay = self.overlay_input(ui, &ov, vw, vh);
+                let (cw, ch) = (vw * self.zoom, vh * self.zoom);
                 self.pan = vec2(view::clamp_pan(self.pan.x, rect.width(), cw), view::clamp_pan(self.pan.y, rect.height(), ch));
 
                 let zoom = self.zoom;
-                let origin = rect.min + self.pan;
+                // `pan` positions the visible region; image coordinates stay original.
+                let origin = rect.min + self.pan - vec2(vx, vy) * zoom;
                 let to_screen = |p: Pt| pos2(origin.x + p.x * zoom, origin.y + p.y * zoom);
                 let to_img = |p: Pos2| Pt::new((p.x - origin.x) / zoom, (p.y - origin.y) / zoom);
                 let img_rect = ERect::from_min_size(origin, vec2(iw * zoom, ih * zoom));
+                let vis_rect = ERect::from_min_size(origin + vec2(vx, vy) * zoom, vec2(vw * zoom, vh * zoom));
+                let cropped_view = vis != (0.0, 0.0, iw, ih);
 
                 if !panning && !space && !over_overlay {
                     self.interact(ctx, &resp, &to_img, &base);
@@ -1614,8 +1730,10 @@ impl EditorApp {
                         spread: 0.0,
                         color: Color32::from_black_alpha(if pal.dark { 110 } else { 41 }),
                     }
-                    .as_shape(img_rect, 2.0),
+                    .as_shape(vis_rect, 2.0),
                 );
+                let ui_painter = painter.clone();
+                let painter = if cropped_view { painter.with_clip_rect(rect.intersect(vis_rect)) } else { painter };
                 painter.rect_filled(img_rect, 0.0, pal.surface);
                 painter.image(tex.id(), img_rect, ERect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
 
@@ -1655,7 +1773,7 @@ impl EditorApp {
                     } else {
                         self.paint_shape(ctx, &painter, &base, &d, &to_screen, zoom, true);
                     }
-                } else if let Some(c) = self.s.doc.crop() {
+                } else if let (Some(c), Tool::Crop) = (self.s.doc.crop(), self.s.tool) {
                     let r = ERect::from_min_max(
                         to_screen(Pt::new(c.x as f32, c.y as f32)),
                         to_screen(Pt::new(c.right() as f32, c.bottom() as f32)),
@@ -1707,7 +1825,7 @@ impl EditorApp {
                     }
                 }
 
-                self.paint_overlays(&painter, &ov, iw, ih);
+                self.paint_overlays(&ui_painter, &ov, vw, vh);
 
                 if self.text_edit.is_some() {
                     self.text_overlay(ctx, &to_screen, zoom);
@@ -1820,6 +1938,20 @@ impl EditorApp {
             }
         }
         if resp.clicked_by(PointerButton::Primary) {
+            // Double-click on a text object edits it with any tool that can grab
+            // objects. This must come first: the second click of the pair would
+            // otherwise be consumed (select + return) by the branch below.
+            if resp.double_clicked_by(PointerButton::Primary) {
+                let hit = pos
+                    .and_then(|p| self.grab_hit(p, tol, mods.command))
+                    .filter(|i| self.s.doc.shapes().get(*i).is_some_and(|s| s.kind.is_text()));
+                if let Some(i) = hit {
+                    self.commit_text();
+                    self.s.select_one(Some(i));
+                    self.edit_text_shape(i);
+                    return;
+                }
+            }
             if let Some(i) = pos.and_then(|p| self.grab_hit(p, tol, mods.command)) {
                 if !self.s.tool.is_text_tool() {
                     self.commit_text();
@@ -1831,13 +1963,13 @@ impl EditorApp {
                 match self.s.tool {
                     Tool::Select => {
                         self.commit_text();
-                        let hit = self.s.doc.hit_test(p, tol);
+                        let hit = self.visible_hit(p, tol);
                         self.s.select_one(hit);
                     }
                     Tool::Text | Tool::TextBox | Tool::Callout => {
                         self.commit_text();
                         let tool = self.s.tool;
-                        let hit = self.s.doc.hit_test(p, tol).filter(|i| self.s.doc.shapes()[*i].kind.is_text());
+                        let hit = self.visible_hit(p, tol).filter(|i| self.s.doc.shapes()[*i].kind.is_text());
                         if let Some(i) = hit {
                             self.edit_text_shape(i);
                         } else if let Some(kind) = self.text_kind_at(tool, p) {
@@ -1869,15 +2001,19 @@ impl EditorApp {
                 }
             }
         }
-        if resp.double_clicked_by(PointerButton::Primary) && self.s.tool == Tool::Select {
-            if let Some(p) = pos {
-                if let Some(i) = self.s.doc.hit_test(p, tol) {
-                    if self.s.doc.shapes()[i].kind.is_text() {
-                        self.edit_text_shape(i);
-                    }
-                }
-            }
+    }
+
+    /// `hit_test` limited to what is visible: with a crop applied, points
+    /// outside the cropped region and shapes entirely outside it never hit.
+    fn visible_hit(&self, p: Pt, tol: f32) -> Option<usize> {
+        let hit = self.s.doc.hit_test(p, tol)?;
+        let Some(base) = &self.base else { return Some(hit) };
+        let (vx, vy, vw, vh) = view::visible_rect(base.width as f32, base.height as f32, self.s.doc.crop(), self.s.tool == Tool::Crop);
+        if p.x < vx || p.y < vy || p.x > vx + vw || p.y > vy + vh {
+            return None;
         }
+        let (min, max) = self.s.doc.shapes().get(hit)?.bounds();
+        (max.x >= vx && max.y >= vy && min.x <= vx + vw && min.y <= vy + vh).then_some(hit)
     }
 
     /// Drawing tools can grab existing objects (ShareX style): pressing on
@@ -1894,7 +2030,7 @@ impl EditorApp {
         if !grabs || self.drawing.is_some() {
             return None;
         }
-        self.s.doc.hit_test(p, tol)
+        self.visible_hit(p, tol)
     }
 
     /// Handles of the selected shape, when exactly one is selected and the
@@ -1954,7 +2090,7 @@ impl EditorApp {
             _ => None,
         };
         if self.s.tool == Tool::Select {
-            let hit = self.s.doc.hit_test(p, tol);
+            let hit = self.visible_hit(p, tol);
             match hit {
                 Some(i) if self.s.is_selected(i) => {}
                 other => self.s.select_one(other),
@@ -2314,12 +2450,15 @@ const GESTURES: &[(&str, &str)] = &[
     ("Space", "+drag = geser kanvas"),
     ("Ctrl", "+scroll = zoom"),
     ("Ctrl", "+drag di atas objek = tetap menggambar"),
+    ("Dobel-klik", " / Enter / F2 pada teks = edit teks"),
     ("Esc", " batal dulu, baru tutup"),
 ];
 
 const SIDE_W: f32 = 272.0;
 const HEAD_H: f32 = 34.0;
 const ROW_H: f32 = 30.0;
+/// Fixed height of the RIWAYAT list.
+const HIST_BODY_H: f32 = 160.0;
 const NAV_BODY_H: f32 = 2.0 + 136.0 + SP_3;
 /// Smallest OBJEK region (header + a couple of rows + footer) before the
 /// sidebar falls back to scrolling.

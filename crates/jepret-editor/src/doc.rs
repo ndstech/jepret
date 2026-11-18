@@ -839,6 +839,50 @@ struct Snapshot {
     rev: u64,
 }
 
+/// Label for the step that turned snapshot `a` into `b`.
+fn describe_step(a: &Snapshot, b: &Snapshot) -> String {
+    let (sa, sb) = (&a.shapes, &b.shapes);
+    if sb.len() > sa.len() {
+        let n = sb.len() - sa.len();
+        return match sb.last() {
+            Some(s) if n == 1 => format!("Tambah {}", s.kind.display_name()),
+            _ => format!("Tambah {n} objek"),
+        };
+    }
+    if sb.len() < sa.len() {
+        let n = sa.len() - sb.len();
+        if n == 1 {
+            let at = (0..sb.len()).find(|&i| sa[i] != sb[i]).unwrap_or(sb.len());
+            return format!("Hapus {}", sa[at].kind.display_name());
+        }
+        return format!("Hapus {n} objek");
+    }
+    let changed: Vec<usize> = (0..sa.len()).filter(|&i| sa[i] != sb[i]).collect();
+    if changed.is_empty() {
+        return match (a.crop == b.crop, b.crop) {
+            (false, None) => "Reset crop".to_string(),
+            (false, Some(_)) => "Crop".to_string(),
+            (true, _) => "Ubah".to_string(),
+        };
+    }
+    if changed.iter().all(|&i| sb.contains(&sa[i])) && changed.iter().all(|&i| sa.contains(&sb[i])) {
+        return "Urutan".to_string();
+    }
+    if let [i] = changed[..] {
+        let (x, y) = (&sa[i], &sb[i]);
+        let name = y.kind.display_name();
+        let style_same = x.color == y.color && x.width == y.width && x.fill == y.fill && x.shadow == y.shadow && x.outline == y.outline;
+        if x.kind == y.kind {
+            return format!("Ubah gaya {name}");
+        }
+        if x.kind.text() != y.kind.text() {
+            return "Edit teks".to_string();
+        }
+        return if style_same { format!("Ubah {name}") } else { format!("Ubah {name} & gaya") };
+    }
+    format!("Ubah {} objek", changed.len())
+}
+
 /// The annotation document. Does not own the image pixels.
 #[derive(Debug)]
 pub struct Document {
@@ -931,6 +975,42 @@ impl Document {
             }
             None => false,
         }
+    }
+
+    /// Number of states in the history (the original + one per undo step +
+    /// the redo states).
+    pub fn history_len(&self) -> usize {
+        self.undo.len() + 1 + self.redo.len()
+    }
+
+    /// Index of the current state in the history (0 = original).
+    pub fn history_pos(&self) -> usize {
+        self.undo.len()
+    }
+
+    /// One label per history state: "Buka" for the original, then what each
+    /// step changed (derived by comparing consecutive snapshots).
+    pub fn history_labels(&self) -> Vec<String> {
+        let states: Vec<&Snapshot> = self.undo.iter().chain(std::iter::once(&self.cur)).chain(self.redo.iter().rev()).collect();
+        let mut out = Vec::with_capacity(states.len());
+        out.push("Buka".to_string());
+        for w in states.windows(2) {
+            out.push(describe_step(w[0], w[1]));
+        }
+        out
+    }
+
+    /// Jump to history state `idx` (clamped), undoing/redoing as many steps
+    /// as needed. Revisions of the snapshots are kept, so dirtiness stays
+    /// correct. Returns whether the state changed.
+    pub fn jump_to(&mut self, idx: usize) -> bool {
+        let idx = idx.min(self.history_len() - 1);
+        let from = self.history_pos();
+        while self.undo.len() > idx {
+            self.undo();
+        }
+        while self.undo.len() < idx && self.redo() {}
+        self.history_pos() != from
     }
 
     /// Add a shape (one undo step). Returns its index.
@@ -1639,5 +1719,50 @@ mod tests {
         assert!(d.undo());
         let xs: Vec<f32> = d.shapes().iter().map(|s| s.bounds().0.x).collect();
         assert_eq!(xs, vec![0.0, 10.0, 20.0]);
+    }
+
+    #[test]
+    fn history_labels_and_jump() {
+        let r = |x: f32| mk(ShapeKind::Rect { a: pt(x, 0.0), b: pt(x + 1.0, 1.0) });
+        let mut d = Document::new();
+        assert_eq!(d.history_labels(), vec!["Buka"]);
+        d.add_shape(r(0.0));
+        d.add_shape(mk(ShapeKind::Text { pos: pt(1.0, 1.0), text: "a".into() }));
+        d.set_crop(Some(jepret_core::Rect::new(0, 0, 5, 5)));
+        d.edit_shape(1, |s| {
+            if let Some(t) = s.kind.text_mut() {
+                *t = "b".into();
+            }
+        });
+        d.edit_shape(0, |s| s.color = [1, 2, 3, 255]);
+        d.move_shape(0, 1);
+        d.remove_shape(0);
+        d.set_crop(None);
+        assert_eq!(
+            d.history_labels(),
+            vec!["Buka", "Tambah Kotak", "Tambah Teks", "Crop", "Edit teks", "Ubah gaya Kotak", "Urutan", "Hapus Teks", "Reset crop"]
+        );
+        let n = d.history_len();
+        assert_eq!(d.history_pos(), n - 1);
+        let rev_end = d.revision();
+        d.mark_saved();
+        // jump back several steps
+        assert!(d.jump_to(2));
+        assert_eq!(d.shapes().len(), 2);
+        assert!(d.crop().is_none());
+        assert!(d.is_dirty());
+        assert_eq!(d.history_len(), n);
+        assert_eq!(d.history_pos(), 2);
+        // jump forward past the end clamps
+        assert!(d.jump_to(99));
+        assert_eq!(d.history_pos(), n - 1);
+        assert_eq!(d.revision(), rev_end);
+        assert!(!d.is_dirty());
+        assert!(!d.jump_to(n - 1));
+        d.jump_to(0);
+        assert!(d.shapes().is_empty());
+        // a new edit drops the redo tail
+        d.add_shape(r(5.0));
+        assert_eq!(d.history_len(), 2);
     }
 }

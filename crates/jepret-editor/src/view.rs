@@ -3,6 +3,8 @@
 //! screen points; `pan` is the offset of the image's top-left corner from
 //! the viewport's top-left corner.
 
+use jepret_core::Rect;
+
 /// Free space kept around the image when it is larger than the viewport,
 /// so its edge (and the drop shadow) stays reachable.
 pub const MARGIN: f32 = 24.0;
@@ -58,9 +60,36 @@ pub fn navigator_size(iw: f32, ih: f32, max_w: f32, max_h: f32) -> (f32, f32) {
     ((iw * s).round().max(1.0), (ih * s).round().max(1.0))
 }
 
+/// Region of the original image shown on the canvas: `(x, y, w, h)` in image
+/// pixels. The whole image while the Crop tool is active or when there is no
+/// (valid) crop; otherwise the crop rect clamped to the image.
+pub fn visible_rect(iw: f32, ih: f32, crop: Option<Rect>, crop_tool: bool) -> (f32, f32, f32, f32) {
+    if let (Some(c), false) = (crop, crop_tool) {
+        let x0 = (c.x as f32).clamp(0.0, iw);
+        let y0 = (c.y as f32).clamp(0.0, ih);
+        let x1 = (c.right() as f32).clamp(0.0, iw);
+        let y1 = (c.bottom() as f32).clamp(0.0, ih);
+        if x1 - x0 >= 1.0 && y1 - y0 >= 1.0 {
+            return (x0, y0, x1 - x0, y1 - y0);
+        }
+    }
+    (0.0, 0.0, iw, ih)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visible_rect_follows_crop_and_tool() {
+        let c = Some(Rect::new(10, 20, 100, 50));
+        assert_eq!(visible_rect(400.0, 300.0, None, false), (0.0, 0.0, 400.0, 300.0));
+        assert_eq!(visible_rect(400.0, 300.0, c, false), (10.0, 20.0, 100.0, 50.0));
+        assert_eq!(visible_rect(400.0, 300.0, c, true), (0.0, 0.0, 400.0, 300.0));
+        // clamped to the image; degenerate falls back to the whole image
+        assert_eq!(visible_rect(50.0, 50.0, c, false), (10.0, 20.0, 40.0, 30.0));
+        assert_eq!(visible_rect(400.0, 300.0, Some(Rect::new(0, 0, 0, 0)), false), (0.0, 0.0, 400.0, 300.0));
+    }
 
     #[test]
     fn small_image_is_centred() {
