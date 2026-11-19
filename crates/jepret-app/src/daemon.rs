@@ -674,10 +674,14 @@ fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> 
             None
         }
         WM_SETTINGCHANGE => {
-            // "ImmersiveColorSet" = light/dark switch.
-            // SAFETY: lParam is a NUL-terminated wide string or null per the message contract.
-            let name = unsafe { PCWSTR(lp.0 as *const u16).to_string().unwrap_or_default() };
-            if name == "ImmersiveColorSet" {
+            // "ImmersiveColorSet" = light/dark switch. lParam is often null
+            // (SystemParametersInfo broadcasts); `PCWSTR::to_string` would
+            // run wcslen on it and crash the daemon, so read it bounded.
+            // SAFETY: per the message contract lParam is null or points to a
+            // NUL-terminated wide string; null is checked and at most
+            // `MAX + 1` units are read, stopping at the first NUL.
+            let name = unsafe { setting_name(lp.0 as *const u16) };
+            if name.as_deref() == Some("ImmersiveColorSet") {
                 refresh_tray_icons();
             }
             None
@@ -961,6 +965,28 @@ fn show_menu(h: HWND) {
     }
 }
 
+/// The setting area named by a `WM_SETTINGCHANGE` lParam: `None` when null
+/// or longer than any name we care about.
+///
+/// # Safety
+/// `p` must be null or point to a NUL-terminated UTF-16 string.
+unsafe fn setting_name(p: *const u16) -> Option<String> {
+    const MAX: usize = 64;
+    if p.is_null() {
+        return None;
+    }
+    let mut units = Vec::with_capacity(32);
+    for i in 0..=MAX {
+        // SAFETY: caller guarantees a NUL-terminated string; we stop at NUL.
+        let u = unsafe { *p.add(i) };
+        if u == 0 {
+            return String::from_utf16(&units).ok();
+        }
+        units.push(u);
+    }
+    None
+}
+
 /// Human-readable shortcut of the first binding for `kind` (e.g. `Ctrl+PrtSc`).
 fn shortcut_label(config: &Config, kind: CaptureKind) -> Option<String> {
     config
@@ -1126,6 +1152,18 @@ fn apply_autostart(config: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setting_name_handles_null_and_bounds() {
+        // SAFETY: null and NUL-terminated buffers below.
+        unsafe {
+            assert_eq!(setting_name(std::ptr::null()), None);
+            let w: Vec<u16> = "ImmersiveColorSet ".encode_utf16().collect();
+            assert_eq!(setting_name(w.as_ptr()).as_deref(), Some("ImmersiveColorSet"));
+            let long: Vec<u16> = std::iter::repeat_n(b'x' as u16, 100).chain([0]).collect();
+            assert_eq!(setting_name(long.as_ptr()), None);
+        }
+    }
 
     #[test]
     fn snipping_default_depends_on_windows_version() {
