@@ -972,18 +972,17 @@ impl Ready {
             pos2(rect.left() + 32.0, rect.top() + 2.0),
             pos2(rect.right() - 10.0 - hint_w - 8.0, rect.bottom() - 2.0),
         );
-        ui.allocate_new_ui(
-            UiBuilder::new().max_rect(edit_rect).layout(Layout::left_to_right(Align::Center)),
-            |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.filter.search)
-                        .id(id)
-                        .frame(false)
-                        .margin(Margin::ZERO)
-                        .hint_text("Cari nama file…")
-                        .desired_width(edit_rect.width()),
-                );
-            },
+        // A child UI inside the already-allocated box: `allocate_new_ui`
+        // would move the parent's cursor back to the edit field's right
+        // edge, so the controls after it overlapped the "Ctrl+F" hint.
+        let mut child = ui.new_child(UiBuilder::new().max_rect(edit_rect).layout(Layout::left_to_right(Align::Center)));
+        child.add(
+            egui::TextEdit::singleline(&mut self.filter.search)
+                .id(id)
+                .frame(false)
+                .margin(Margin::ZERO)
+                .hint_text("Cari nama file…")
+                .desired_width(edit_rect.width()),
         );
     }
 
