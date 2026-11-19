@@ -321,7 +321,7 @@ mod tests {
     use jepret_core::{config::HotkeyBinding, CaptureKind, CommandSpec};
 
     fn hk(keys: &str) -> HotkeyBinding {
-        HotkeyBinding { keys: keys.into(), capture: CaptureKind::Region, actions: vec![] }
+        HotkeyBinding { keys: keys.into(), capture: CaptureKind::Region, actions: vec![], delay_secs: 0 }
     }
 
     #[test]
@@ -405,6 +405,7 @@ mod tests {
                 Action::OpenWith("x".into()),
                 Action::RunCommand(CommandSpec { path: "C:/a b/t.exe".into(), args: vec!["{file}".into()], hidden: true }),
             ],
+            delay_secs: 3,
         });
         add_app(&mut c, "C:/Tools/Paint.NET/paint.exe".into(), Some("Paint".into()));
         c.save(&path).unwrap();

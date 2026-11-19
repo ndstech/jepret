@@ -112,6 +112,13 @@ pub struct HotkeyBinding {
     pub capture: CaptureKind,
     #[serde(default)]
     pub actions: Vec<Action>,
+    /// Wait this many seconds before capturing (menus, tooltips).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub delay_secs: u32,
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,6 +187,7 @@ impl Default for Config {
             keys: keys.into(),
             capture,
             actions,
+            delay_secs: 0,
         };
         Self {
             general: General::default(),

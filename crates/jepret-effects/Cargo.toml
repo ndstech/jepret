@@ -1,0 +1,13 @@
+[package]
+name = "jepret-effects"
+description = "Image effects: rounded corners, border, shadow, torn edges, watermark (pure)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+jepret-core.workspace = true
+jepret-ui-theme.workspace = true
+tracing.workspace = true
+ab_glyph = "0.2"
+epaint_default_fonts = "0.29"

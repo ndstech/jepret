@@ -1,0 +1,11 @@
+[package]
+name = "jepret-pin"
+description = "Pin a screenshot on screen (always-on-top window)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+jepret-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

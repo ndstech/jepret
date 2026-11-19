@@ -853,6 +853,7 @@ impl SettingsApp {
                 keys: String::new(),
                 capture: CaptureKind::Region,
                 actions: vec![Action::Save, Action::Clipboard],
+                delay_secs: 0,
             });
         }
         muted(ui, &pal, "Format kanonik: ctrl+shift+printscreen, alt+f5, ctrl+plus ... (lihat juga tab Shortcut).");

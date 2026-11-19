@@ -7,6 +7,7 @@
 pub mod action;
 pub mod capture;
 pub mod config;
+pub mod effects;
 pub mod geom;
 pub mod image;
 pub mod keys;
@@ -19,6 +20,7 @@ pub mod template;
 pub use action::{Action, CommandSpec};
 pub use capture::{CaptureKind, CaptureResult};
 pub use config::Config;
+pub use effects::EffectSpec;
 pub use geom::{Point, Rect};
 pub use image::Image;
 pub use keys::KeyCombo;

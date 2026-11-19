@@ -1089,6 +1089,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "jepret-effects"
+version = "0.1.0"
+dependencies = [
+ "ab_glyph",
+ "epaint_default_fonts",
+ "jepret-core",
+ "jepret-ui-theme",
+ "tracing",
+]
+
+[[package]]
 name = "jepret-gallery"
 version = "0.1.0"
 dependencies = [
@@ -1118,6 +1129,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "jepret-ocr"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "jepret-core",
+ "tracing",
+]
+
+[[package]]
 name = "jepret-overlay"
 version = "0.1.0"
 dependencies = [
@@ -1125,6 +1145,15 @@ dependencies = [
  "jepret-core",
  "tracing",
  "windows 0.58.0",
+]
+
+[[package]]
+name = "jepret-pin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "jepret-core",
+ "tracing",
 ]
 
 [[package]]
