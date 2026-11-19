@@ -95,6 +95,7 @@ const ID_SETTINGS: usize = 201;
 const ID_OPEN_FOLDER: usize = 202;
 const ID_QUIT: usize = 203;
 const ID_STOP_REC: usize = 204;
+const ID_OCR: usize = 205;
 const ID_KIND_BASE: usize = 100;
 
 static HWND_RAW: AtomicIsize = AtomicIsize::new(0);
@@ -332,6 +333,17 @@ fn add_tray_icon(window: HWND, recording: bool) {
         let _ = Shell_NotifyIconW(NIM_ADD, &nid);
         nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
         let _ = Shell_NotifyIconW(NIM_SETVERSION, &nid);
+    }
+}
+
+/// Replace only the tray tooltip (safe to call from any thread).
+fn set_tray_tip(tip: &str) {
+    let mut nid = base_nid(hwnd());
+    nid.uFlags = NIF_TIP;
+    copy_utf16(&mut nid.szTip, tip);
+    // SAFETY: nid valid for the call; the shell serialises icon updates.
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
 }
 
@@ -759,13 +771,13 @@ fn on_hotkey(id: i32) {
     if let Some(b) = binding {
         debug!(keys = %b.keys, "hotkey");
         let actions = if b.actions.is_empty() { None } else { Some(b.actions) };
-        spawn_capture_with(b.capture, actions);
+        spawn_capture_with(b.capture, actions, b.delay_secs);
     }
 }
 
 fn run_command(h: HWND, c: Command) {
     match c {
-        Command::Capture(kind) => spawn_capture_with(kind, None),
+        Command::Capture(kind) => spawn_capture_with(kind, None, 0),
         Command::Reload => reload_config(h),
     }
 }
@@ -773,11 +785,13 @@ fn run_command(h: HWND, c: Command) {
 /// `WM_SPAWN` helper (kind index) — kept so menu commands can be posted too.
 fn spawn_capture(kind_index: u32, actions: Option<Vec<Action>>) {
     if let Some((_, k)) = command::KIND_NAMES.get(kind_index as usize) {
-        spawn_capture_with(*k, actions);
+        spawn_capture_with(*k, actions, 0);
     }
 }
 
-fn spawn_capture_with(kind: CaptureKind, actions: Option<Vec<Action>>) {
+/// `delay_secs` (from `HotkeyBinding::delay_secs`) is slept on the capture
+/// worker thread before acquiring; recording kinds ignore it.
+fn spawn_capture_with(kind: CaptureKind, actions: Option<Vec<Action>>, delay_secs: u32) {
     // Pressing the record hotkey again while recording = stop.
     if kind.is_recording() && dispatch::stop_recording() {
         return;
@@ -794,7 +808,14 @@ fn spawn_capture_with(kind: CaptureKind, actions: Option<Vec<Action>>) {
         }
     };
     let actions = actions.unwrap_or_else(|| command::actions_for(&config, kind));
+    let delay = if kind.is_recording() { None } else { dispatch::delay_duration(delay_secs) };
     let spawned = std::thread::Builder::new().name("jepret-capture".into()).spawn(move || {
+        if let Some(d) = delay {
+            // Worker thread, never the message loop: a plain sleep is fine here.
+            set_tray_tip(&format!("Jepret - capture dalam {} s", d.as_secs()));
+            std::thread::sleep(d);
+            set_tray_tip("Jepret");
+        }
         let ctx = Ctx { config: &config, notify };
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch::handle(&ctx, kind, &actions)));
         match r {
@@ -878,6 +899,7 @@ fn menu_rows(recording: bool) -> Vec<Row> {
         Row::Item(kind_id(K::ActiveWindow), "Window aktif", Some(K::ActiveWindow), MenuGlyph::Path(Icon::Window)),
         Row::Item(kind_id(K::LastRegion), "Last region", Some(K::LastRegion), MenuGlyph::Path(Icon::History)),
         Row::Item(kind_id(K::Scroll), "Scroll capture", Some(K::Scroll), MenuGlyph::Path(Icon::Scroll)),
+        Row::Item(ID_OCR, "Ambil teks (OCR)", None, MenuGlyph::Path(Icon::Frame)),
         Row::Sep,
         rec,
         Row::Sep,
@@ -1027,6 +1049,7 @@ fn on_menu_command(h: HWND, id: usize) {
         ID_STOP_REC => {
             dispatch::stop_recording();
         }
+        ID_OCR => spawn_capture_with(CaptureKind::Region, Some(vec![Action::Ocr]), 0),
         ID_QUIT => {
             // SAFETY: destroys our own window → WM_DESTROY → shutdown.
             unsafe {

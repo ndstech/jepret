@@ -203,12 +203,47 @@ fn line_width<F: Font, SF: ScaleFont<F>>(sf: &SF, line: &str) -> f32 {
 /// Render the document: annotations over `base`, then crop.
 pub fn flatten(base: &Image, doc: &Document) -> Image {
     let mut canvas = base.clone();
-    for shape in doc.shapes() {
+    // The spotlight dimming is one shared layer, applied right after the
+    // topmost spotlight's z-position (see `ShapeKind::Spotlight`).
+    let last_spot = doc.shapes().iter().rposition(|s| matches!(s.kind, ShapeKind::Spotlight { .. }));
+    for (i, shape) in doc.shapes().iter().enumerate() {
         draw_shape(&mut canvas, base, shape);
+        if last_spot == Some(i) {
+            dim_outside_spotlights(&mut canvas, doc.shapes());
+        }
     }
     match doc.crop() {
         Some(r) => canvas.crop(r).unwrap_or(canvas),
         None => canvas,
+    }
+}
+
+/// `spec` with the watermark text's placeholders expanded
+/// (`{date}`, `{time}`, `{datetime}`, `{width}`, `{height}`).
+pub fn expand_effects(spec: &jepret_core::EffectSpec, now: chrono::NaiveDateTime, dims: (u32, u32)) -> jepret_core::EffectSpec {
+    let mut spec = spec.clone();
+    if let Some(w) = spec.watermark.as_mut() {
+        let vars = [
+            ("datetime", now.format("%Y-%m-%d_%H-%M-%S").to_string()),
+            ("date", now.format("%Y-%m-%d").to_string()),
+            ("time", now.format("%H-%M-%S").to_string()),
+            ("width", dims.0.to_string()),
+            ("height", dims.1.to_string()),
+        ];
+        w.text = jepret_core::template::expand(&w.text, &vars);
+    }
+    spec
+}
+
+/// Final export pixels: [`flatten`] (annotations + crop), then the document's
+/// effects ([`jepret_effects::apply`]). Skips the effects pass when it is a no-op.
+pub fn export(base: &Image, doc: &Document, now: chrono::NaiveDateTime) -> Image {
+    let out = flatten(base, doc);
+    let spec = expand_effects(doc.effects(), now, (out.width, out.height));
+    if spec.is_noop() {
+        out
+    } else {
+        jepret_effects::apply(&out, &spec)
     }
 }
 
@@ -295,6 +330,29 @@ pub fn draw_shape(canvas: &mut Image, src: &Image, shape: &Shape) {
         ShapeKind::Text { .. } | ShapeKind::TextBox { .. } | ShapeKind::Callout { .. } => {
             draw_text_shape(canvas, shape, false);
         }
+        // Drawn collectively by `dim_outside_spotlights` (see `flatten`).
+        ShapeKind::Spotlight { .. } => {}
+        ShapeKind::Magnify { center, radius, zoom } => {
+            let r = radius.max(1.0);
+            let z = zoom.max(1.0);
+            let bb = bbox(Pt::new(center.x - r, center.y - r), Pt::new(center.x + r, center.y + r), 1.0);
+            let (x0, y0) = (bb.0.max(0), bb.1.max(0));
+            let (x1, y1) = (bb.2.min(canvas.width as i32), bb.3.min(canvas.height as i32));
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                    let d = (px - center.x).hypot(py - center.y) - r;
+                    let cov = (0.5 - d).clamp(0.0, 1.0);
+                    if cov > 0.0 {
+                        let col = sample_bilinear(src, center.x + (px - center.x) / z, center.y + (py - center.y) / z);
+                        blend(canvas, x, y, col, cov);
+                    }
+                }
+            }
+            // Border sits inside the circle edge.
+            let rc = (r - w / 2.0).max(0.0);
+            paint(canvas, bb, c, |x, y| ((x - center.x).hypot(y - center.y) - rc).abs() - w / 2.0);
+        }
         ShapeKind::Polygon { points } => {
             if points.len() >= 3 {
                 let (min, max) = shape.bounds();
@@ -320,6 +378,80 @@ pub fn draw_shape(canvas: &mut Image, src: &Image, shape: &Shape) {
             let (tw, th) = text_size(&label, px);
             let white = [255, 255, 255, 255];
             draw_text(canvas, Pt::new(center.x - tw / 2.0, center.y - th / 2.0), &label, px, white, true);
+        }
+    }
+}
+
+/// Bilinear sample of `img` at image-px position `(x, y)` (pixel centres at
+/// +0.5), edge-clamped.
+pub fn sample_bilinear(img: &Image, x: f32, y: f32) -> Rgba {
+    if img.width == 0 || img.height == 0 {
+        return [0; 4];
+    }
+    let (fx, fy) = (x - 0.5, y - 0.5);
+    let (x0, y0) = (fx.floor(), fy.floor());
+    let (tx, ty) = (fx - x0, fy - y0);
+    let at = |xi: f32, yi: f32| {
+        let xc = (xi as i64).clamp(0, img.width as i64 - 1) as u32;
+        let yc = (yi as i64).clamp(0, img.height as i64 - 1) as u32;
+        img.pixel(xc, yc)
+    };
+    let (p00, p10, p01, p11) = (at(x0, y0), at(x0 + 1.0, y0), at(x0, y0 + 1.0), at(x0 + 1.0, y0 + 1.0));
+    let mut out = [0u8; 4];
+    for k in 0..4 {
+        let top = p00[k] as f32 * (1.0 - tx) + p10[k] as f32 * tx;
+        let bot = p01[k] as f32 * (1.0 - tx) + p11[k] as f32 * tx;
+        out[k] = (top * (1.0 - ty) + bot * ty).round().clamp(0.0, 255.0) as u8;
+    }
+    out
+}
+
+/// Coverage (0..=1, anti-aliased) of a spotlight shape at `(x, y)`.
+fn spotlight_coverage(shape: &Shape, x: f32, y: f32) -> f32 {
+    let ShapeKind::Spotlight { a, b } = &shape.kind else { return 0.0 };
+    let (min, max) = norm(*a, *b);
+    let (cx, cy) = ((min.x + max.x) / 2.0, (min.y + max.y) / 2.0);
+    let (hx, hy) = (((max.x - min.x) / 2.0).max(0.5), ((max.y - min.y) / 2.0).max(0.5));
+    let sd = if shape.fill {
+        let (dx, dy) = (x - cx, y - cy);
+        let f = ((dx / hx).powi(2) + (dy / hy).powi(2)).sqrt();
+        let (gx, gy) = (dx / (hx * hx), dy / (hy * hy));
+        let g = (gx * gx + gy * gy).sqrt() / f.max(1e-6);
+        if g > 1e-9 { (f - 1.0) / g } else { -hx.min(hy) }
+    } else {
+        let qx = (x - cx).abs() - hx;
+        let qy = (y - cy).abs() - hy;
+        qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0)
+    };
+    (0.5 - sd).clamp(0.0, 1.0)
+}
+
+/// Darken everything outside the union of all spotlights in `shapes`
+/// (one shared layer; overlapping spotlights do not stack).
+pub fn dim_outside_spotlights(canvas: &mut Image, shapes: &[Shape]) {
+    let spots: Vec<&Shape> = shapes.iter().filter(|s| matches!(s.kind, ShapeKind::Spotlight { .. })).collect();
+    if spots.is_empty() {
+        return;
+    }
+    let dim = [0, 0, 0, crate::doc::SPOTLIGHT_DIM_ALPHA];
+    // Per-spotlight bounds to skip the expensive coverage for far pixels.
+    let bounds: Vec<(Pt, Pt)> = spots.iter().map(|s| s.bounds()).collect();
+    for y in 0..canvas.height as i32 {
+        for x in 0..canvas.width as i32 {
+            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+            let mut inside = 0f32;
+            for (s, (min, max)) in spots.iter().zip(&bounds) {
+                if px < min.x - 1.0 || px > max.x + 1.0 || py < min.y - 1.0 || py > max.y + 1.0 {
+                    continue;
+                }
+                inside = inside.max(spotlight_coverage(s, px, py));
+                if inside >= 1.0 {
+                    break;
+                }
+            }
+            if inside < 1.0 {
+                blend(canvas, x, y, dim, 1.0 - inside);
+            }
         }
     }
 }
@@ -1228,5 +1360,105 @@ mod tests {
         let base = gradient(16, 16);
         let out = flatten(&base, &Document::new());
         assert_eq!(out.pixels, base.pixels);
+    }
+
+    fn hgrad(w: u32, h: u32) -> Image {
+        let mut img = Image::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) as usize * 4;
+                img.pixels[i..i + 4].copy_from_slice(&[x as u8, x as u8, x as u8, 255]);
+            }
+        }
+        img
+    }
+
+    fn spot(x0: f32, y0: f32, x1: f32, y1: f32) -> Shape {
+        Shape::new(ShapeKind::Spotlight { a: Pt::new(x0, y0), b: Pt::new(x1, y1) }, [0; 4], 1.0)
+    }
+
+    #[test]
+    fn spotlight_dims_outside_union_only() {
+        let base = solid(100, 100, [255, 255, 255, 255]);
+        let mut d = Document::new();
+        d.add_shape(spot(20.0, 20.0, 60.0, 60.0));
+        d.add_shape(spot(40.0, 40.0, 90.0, 90.0)); // overlaps the first
+        let out = flatten(&base, &d);
+        assert_eq!(out.pixel(30, 30), [255, 255, 255, 255], "inside 1st");
+        assert_eq!(out.pixel(50, 50), [255, 255, 255, 255], "inside both");
+        assert_eq!(out.pixel(80, 80), [255, 255, 255, 255], "inside 2nd");
+        let dark = out.pixel(5, 5);
+        let want = 255.0 * (1.0 - crate::doc::SPOTLIGHT_DIM_ALPHA as f32 / 255.0);
+        assert!((dark[0] as f32 - want).abs() <= 1.5, "{dark:?} vs {want}");
+        assert_eq!(dark[3], 255);
+        // A pixel outside both is dimmed once, not once per spotlight.
+        assert_eq!(out.pixel(95, 10), dark);
+    }
+
+    #[test]
+    fn spotlight_ellipse_dims_bbox_corner() {
+        let base = solid(100, 100, [255, 255, 255, 255]);
+        let mut d = Document::new();
+        let mut s = spot(10.0, 10.0, 90.0, 90.0);
+        s.fill = true; // elliptical
+        d.add_shape(s);
+        let out = flatten(&base, &d);
+        assert_eq!(out.pixel(50, 50), [255, 255, 255, 255]);
+        assert!(out.pixel(12, 12)[0] < 200, "corner outside the ellipse is dimmed");
+    }
+
+    #[test]
+    fn spotlight_dims_shapes_below_not_above() {
+        let base = solid(100, 100, [255, 255, 255, 255]);
+        let mut d = Document::new();
+        let red_rect = |a: Pt, b: Pt| Shape { fill: true, ..Shape::new(ShapeKind::Rect { a, b }, [255, 0, 0, 255], 1.0) };
+        d.add_shape(red_rect(Pt::new(0.0, 0.0), Pt::new(20.0, 20.0)));
+        d.add_shape(spot(40.0, 40.0, 60.0, 60.0));
+        d.add_shape(red_rect(Pt::new(80.0, 80.0), Pt::new(100.0, 100.0)));
+        let out = flatten(&base, &d);
+        assert!(out.pixel(5, 5)[1] < 100 && out.pixel(5, 5)[0] > 100, "red below the spotlight is dimmed");
+        assert_eq!(out.pixel(90, 90), [255, 0, 0, 255], "red above stays bright");
+    }
+
+    #[test]
+    fn magnify_samples_offset_over_zoom() {
+        let base = hgrad(200, 100);
+        let mut d = Document::new();
+        d.add_shape(Shape::new(
+            ShapeKind::Magnify { center: Pt::new(100.0, 50.0), radius: 40.0, zoom: 2.0 },
+            [255, 0, 0, 255],
+            2.0,
+        ));
+        let out = flatten(&base, &d);
+        // pixel 120 is +20.5 from the centre -> source x = 100 + 20.5 / 2 = 110.25
+        // (pixel i holds value i at its centre i + 0.5, so the value is ~109.75).
+        let v = out.pixel(120, 50)[0] as i32;
+        assert!((v - 110).abs() <= 1, "{v}");
+        let v = out.pixel(80, 50)[0] as i32; // -19.5 -> 90.25 -> ~89.75
+        assert!((v - 90).abs() <= 1, "{v}");
+        // Outside the circle and its border: untouched.
+        assert_eq!(out.pixel(150, 50), base.pixel(150, 50));
+        assert_eq!(out.pixel(100, 5), base.pixel(100, 5));
+        // The border (inside the edge) takes the shape colour.
+        assert_eq!(out.pixel(100 + 39, 50), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn expand_effects_fills_placeholders() {
+        let spec = jepret_core::EffectSpec {
+            watermark: Some(jepret_core::effects::Watermark { text: "{date} {width}x{height}".into(), ..Default::default() }),
+            ..Default::default()
+        };
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 3, 4).and_then(|d| d.and_hms_opt(5, 6, 7)).unwrap_or_default();
+        let out = expand_effects(&spec, now, (10, 20));
+        assert_eq!(out.watermark.map(|w| w.text).as_deref(), Some("2026-03-04 10x20"));
+    }
+
+    #[test]
+    fn export_without_effects_equals_flatten() {
+        let base = gradient(20, 20);
+        let d = Document::new();
+        let now = chrono::NaiveDateTime::default();
+        assert_eq!(export(&base, &d, now).pixels, flatten(&base, &d).pixels);
     }
 }

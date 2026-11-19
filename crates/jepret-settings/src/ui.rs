@@ -9,6 +9,7 @@ use egui::{
 };
 use jepret_core::{
     config::{HotkeyBinding, ImageFormat, ThemeMode},
+    effects::{Anchor, EffectSpec, Watermark},
     shortcuts::EDITOR_SHORTCUTS,
     Action, CaptureKind, CommandSpec, Config, KeyCombo,
 };
@@ -825,6 +826,12 @@ impl SettingsApp {
                         ui.label(RichText::new(m).color(pal.danger));
                     }
                 }
+                ui.add_enabled_ui(!b.capture.is_recording(), |ui| {
+                    labeled(ui, &pal, "Tunda (detik):", |ui| {
+                        ui.add(egui::DragValue::new(&mut b.delay_secs).range(0..=model::MAX_DELAY_SECS));
+                        muted(ui, &pal, "0 = langsung; tidak berlaku untuk rekaman");
+                    });
+                });
                 muted(ui, &pal, "Actions (berurutan):");
                 structural |= actions_editor(ui, &pal, &format!("hk{i}"), &mut b.actions, &keys, &mut self.bufs, false);
             });
@@ -855,6 +862,9 @@ impl SettingsApp {
                 actions: vec![Action::Save, Action::Clipboard],
                 delay_secs: 0,
             });
+        }
+        if widgets::button(ui, &pal, Some(Icon::Plus), "Tambah hotkey OCR", None).clicked() {
+            self.cfg.hotkeys.push(model::ocr_binding());
         }
         muted(ui, &pal, "Format kanonik: ctrl+shift+printscreen, alt+f5, ctrl+plus ... (lihat juga tab Shortcut).");
     }
@@ -1199,6 +1209,86 @@ fn app_keys(cfg: &Config) -> Vec<String> {
     cfg.apps.keys().cloned().collect()
 }
 
+const ANCHORS: [(Anchor, &str); 9] = [
+    (Anchor::TopLeft, "Kiri atas"),
+    (Anchor::Top, "Atas"),
+    (Anchor::TopRight, "Kanan atas"),
+    (Anchor::Left, "Kiri"),
+    (Anchor::Center, "Tengah"),
+    (Anchor::Right, "Kanan"),
+    (Anchor::BottomLeft, "Kiri bawah"),
+    (Anchor::Bottom, "Bawah"),
+    (Anchor::BottomRight, "Kanan bawah"),
+];
+
+fn anchor_label(a: Anchor) -> &'static str {
+    ANCHORS.iter().find(|(x, _)| *x == a).map(|(_, l)| *l).unwrap_or("?")
+}
+
+/// Hex colour field; text turns red when it does not parse.
+fn color_edit(ui: &mut Ui, pal: &Palette, s: &mut String) {
+    let bad = jepret_core::effects::parse_hex_color(s).is_none();
+    let mut te = egui::TextEdit::singleline(s).desired_width(80.0).hint_text("#rrggbb");
+    if bad {
+        te = te.text_color(pal.danger);
+    }
+    ui.add(te);
+}
+
+/// Compact inline editor for an `effects` action.
+fn effects_editor(ui: &mut Ui, pal: &Palette, spec: &mut EffectSpec) {
+    labeled(ui, pal, "Radius sudut (px):", |ui| {
+        ui.add(egui::DragValue::new(&mut spec.corner_radius).range(0..=200));
+    });
+    labeled(ui, pal, "Border (px):", |ui| {
+        ui.add(egui::DragValue::new(&mut spec.border_width).range(0..=50));
+        if spec.border_width > 0 {
+            ui.label(RichText::new("warna:").color(pal.muted));
+            color_edit(ui, pal, &mut spec.border_color);
+        }
+    });
+    let mut shadow = spec.shadow_blur > 0;
+    ui.horizontal(|ui| {
+        if widgets::toggle(ui, pal, &mut shadow, "Bayangan", None).changed() {
+            spec.shadow_blur = if shadow { 16 } else { 0 };
+        }
+        if shadow {
+            ui.label(RichText::new("blur:").color(pal.muted));
+            ui.add(egui::DragValue::new(&mut spec.shadow_blur).range(1..=100));
+            ui.label(RichText::new("warna:").color(pal.muted));
+            color_edit(ui, pal, &mut spec.shadow_color);
+        }
+    });
+    labeled(ui, pal, "Sisi sobek:", |ui| {
+        ui.checkbox(&mut spec.torn.top, "atas");
+        ui.checkbox(&mut spec.torn.right, "kanan");
+        ui.checkbox(&mut spec.torn.bottom, "bawah");
+        ui.checkbox(&mut spec.torn.left, "kiri");
+    });
+    let mut wm_on = spec.watermark.is_some();
+    if widgets::toggle(ui, pal, &mut wm_on, "Watermark", None).changed() {
+        spec.watermark = wm_on.then(Watermark::default);
+    }
+    if let Some(w) = &mut spec.watermark {
+        labeled(ui, pal, "Teks:", |ui| {
+            ui.add(egui::TextEdit::singleline(&mut w.text).desired_width(220.0).hint_text("(c) {date}"));
+        });
+        labeled(ui, pal, "Posisi:", |ui| {
+            egui::ComboBox::from_id_salt(("wm-pos", ui.id())).selected_text(anchor_label(w.position)).show_ui(
+                ui,
+                |ui| {
+                    for (a, l) in ANCHORS {
+                        ui.selectable_value(&mut w.position, a, l);
+                    }
+                },
+            );
+            ui.label(RichText::new("opasitas (%):").color(pal.muted));
+            ui.add(egui::DragValue::new(&mut w.opacity).range(0..=100));
+        });
+        muted(ui, pal, "Placeholder: {date} {time} {datetime} {width} {height}");
+    }
+}
+
 /// Ordered action list editor. Returns true when the list structure changed
 /// (callers then drop cached text buffers for it).
 fn actions_editor(
@@ -1225,7 +1315,7 @@ fn actions_editor(
             if sbtn(ui, pal, "x") {
                 remove = Some(j);
             }
-            match a {
+            match &mut *a {
                 Action::OpenWith(key) => {
                     ui.label("open_with");
                     egui::ComboBox::from_id_salt((id, j)).selected_text(key.as_str()).show_ui(ui, |ui| {
@@ -1243,11 +1333,23 @@ fn actions_editor(
                         c.args = model::split_args(buf);
                     }
                 }
+                Action::Ocr => {
+                    ui.label("Ambil teks (OCR)");
+                }
+                Action::Pin => {
+                    ui.label("Pin ke layar");
+                }
+                Action::Effects(_) => {
+                    ui.label("Efek gambar");
+                }
                 other => {
                     ui.label(other.label());
                 }
             }
         });
+        if let Action::Effects(spec) = a {
+            ui.indent(("fx", id, j), |ui| effects_editor(ui, pal, spec));
+        }
     }
     ui.horizontal(|ui| {
         let mut add: Option<Action> = None;
@@ -1263,6 +1365,17 @@ fn actions_editor(
             for a in simple {
                 if (!file_only || a.needs_file()) && ui.selectable_label(false, a.label()).clicked() {
                     add = Some(a);
+                }
+            }
+            if !file_only {
+                for (label, a) in [
+                    ("Ambil teks (OCR)", Action::Ocr),
+                    ("Pin ke layar", Action::Pin),
+                    ("Efek gambar", Action::Effects(EffectSpec::default())),
+                ] {
+                    if ui.selectable_label(false, label).clicked() {
+                        add = Some(a);
+                    }
                 }
             }
             if ui.selectable_label(false, "open_with").clicked() {

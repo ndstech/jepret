@@ -57,7 +57,7 @@ impl EffectSpec {
             && self.border_width == 0
             && !self.torn.any()
             && self.shadow_blur == 0
-            && self.watermark.as_ref().map_or(true, |w| w.text.trim().is_empty())
+            && self.watermark.as_ref().is_none_or(|w| w.text.trim().is_empty())
     }
 }
 

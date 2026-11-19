@@ -314,11 +314,33 @@ pub fn add_app(cfg: &mut Config, path: PathBuf, name: Option<String>) -> String 
     key
 }
 
+/// Preset for "Tambah hotkey OCR": region capture -> OCR, keys left empty.
+pub fn ocr_binding() -> jepret_core::config::HotkeyBinding {
+    jepret_core::config::HotkeyBinding {
+        keys: String::new(),
+        capture: jepret_core::CaptureKind::Region,
+        actions: vec![Action::Ocr],
+        delay_secs: 0,
+    }
+}
+
+/// Longest capture delay the UI offers (seconds).
+pub const MAX_DELAY_SECS: u32 = 30;
+
 #[cfg(test)]
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use jepret_core::{config::HotkeyBinding, CaptureKind, CommandSpec};
+
+    #[test]
+    fn ocr_preset_is_region_ocr_without_keys() {
+        let b = ocr_binding();
+        assert_eq!(b.capture, CaptureKind::Region);
+        assert_eq!(b.actions, vec![Action::Ocr]);
+        assert!(b.keys.is_empty());
+        assert_eq!(b.delay_secs, 0);
+    }
 
     fn hk(keys: &str) -> HotkeyBinding {
         HotkeyBinding { keys: keys.into(), capture: CaptureKind::Region, actions: vec![], delay_secs: 0 }

@@ -30,6 +30,8 @@ pub enum Icon {
     Step,
     Pen,
     Polygon,
+    Spotlight,
+    Magnify,
     Eyedropper,
     // ---- ui ----
     /// App glyph: four viewfinder corners.
@@ -68,7 +70,7 @@ impl Icon {
     pub const ALL: &'static [Icon] = &[
         Icon::Select, Icon::Crop, Icon::Arrow, Icon::Line, Icon::Rect, Icon::Ellipse, Icon::Text,
         Icon::TextBox, Icon::Callout,
-        Icon::Highlight, Icon::Blur, Icon::Pixelate, Icon::Step, Icon::Pen, Icon::Polygon, Icon::Eyedropper,
+        Icon::Highlight, Icon::Blur, Icon::Pixelate, Icon::Step, Icon::Pen, Icon::Polygon, Icon::Spotlight, Icon::Magnify, Icon::Eyedropper,
         Icon::Frame, Icon::Undo, Icon::Redo, Icon::Copy, Icon::Save, Icon::OpenExternal,
         Icon::Folder, Icon::Search, Icon::Star, Icon::Trash, Icon::Calendar, Icon::Close,
         Icon::Check, Icon::Warning, Icon::Play, Icon::Gallery, Icon::Settings, Icon::Record,
@@ -77,7 +79,7 @@ impl Icon {
     ];
 
     /// Editor tools in toolbar order, matching `tool.*` shortcut ids.
-    pub const TOOLS: [(Icon, &'static str); 16] = [
+    pub const TOOLS: [(Icon, &'static str); 18] = [
         (Icon::Select, "tool.select"),
         (Icon::Crop, "tool.crop"),
         (Icon::Arrow, "tool.arrow"),
@@ -93,6 +95,8 @@ impl Icon {
         (Icon::Step, "tool.step"),
         (Icon::Pen, "tool.pen"),
         (Icon::Polygon, "tool.polygon"),
+        (Icon::Spotlight, "tool.spotlight"),
+        (Icon::Magnify, "tool.magnify"),
         (Icon::Eyedropper, "tool.eyedropper"),
     ];
 
@@ -114,6 +118,8 @@ impl Icon {
             Icon::Step => "M12 3a9 9 0 1 1 0 18a9 9 0 1 1 0-18z M10.5 9l2-1.5V16",
             Icon::Pen => "M4 20l4-1 11-11-3-3L5 16z M14 7l3 3",
             Icon::Polygon => "M12 3l9 6.5-3.5 10.5h-11L3 9.5z",
+            Icon::Spotlight => "M3 5h18v14H3z M12 8a4 4 0 1 1 0 8a4 4 0 1 1 0-8z",
+            Icon::Magnify => "M10.5 4a6.5 6.5 0 1 1 0 13a6.5 6.5 0 1 1 0-13z M15.5 15.5L20 20 M8 10.5h5 M10.5 8v5",
             Icon::Eyedropper => "M15 3l6 6 M18 6l-9 9-4 1 1-4 9-9 M3 21l2-2",
             Icon::Frame => "M4 9V5a1 1 0 0 1 1-1h4 M15 4h4a1 1 0 0 1 1 1v4 M20 15v4a1 1 0 0 1-1 1h-4 M9 20H5a1 1 0 0 1-1-1v-4",
             Icon::Undo => "M9 14L4 9l5-5 M4 9h10a6 6 0 0 1 0 12h-3",
@@ -582,7 +588,7 @@ mod tests {
 
     #[test]
     fn all_icons_parse_and_stay_in_box() {
-        assert_eq!(Icon::ALL.len(), 44); // 16 tools + 28 ui icons
+        assert_eq!(Icon::ALL.len(), 46); // 18 tools + 28 ui icons
         for &i in Icon::ALL {
             let sp = parse_path(i.path()).unwrap_or_else(|e| panic!("{i:?}: {e}"));
             assert!(!sp.is_empty(), "{i:?}");

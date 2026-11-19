@@ -6,6 +6,16 @@
 //! * If any action [`Action::needs_file`] and no file exists yet, the image
 //!   is first written to `paths::temp_dir()`. (If `save` is in the list, it is
 //!   run early instead, so the real output file is used.)
+//! * `effects` replaces the working image: every later action (save,
+//!   clipboard, OCR, file actions, pin) sees the processed image. The
+//!   original capture is never touched, so effects cannot be applied twice.
+//!   If a file was already written *before* `effects` (e.g. `save, effects,
+//!   pin`), that file keeps the unprocessed image; later file actions get a
+//!   fresh temp file with the processed one. Put `effects` first to have the
+//!   saved file processed too.
+//! * `ocr` copies the recognised text to the clipboard (never overwritten
+//!   when nothing is recognised) and sets [`WorkflowOutcome::notification`].
+//! * Recordings (`run_for_file`) skip `ocr`, `effects` and `pin`.
 //! * Does **not** touch history — the caller (app) inserts into history
 //!   using `WorkflowOutcome::saved_path`.
 //!
@@ -59,23 +69,46 @@ pub fn run(
     capture: &CaptureResult,
     actions: &[Action],
 ) -> Result<WorkflowOutcome> {
-    let image = &capture.image;
-    let dims = Some((image.width, image.height));
     let mut out = WorkflowOutcome::default();
     let mut save_done = false;
+    // Image produced by `effects`; `None` = still the original capture.
+    let mut processed: Option<jepret_core::Image> = None;
+    // Set when `effects` ran after a file was already written.
+    let mut stale_file = false;
+    let mut fresh_file: Option<PathBuf> = None;
 
     for action in actions {
         let label = action.label();
         let res: Result<()> = (|| {
+            let image = processed.as_ref().unwrap_or(&capture.image);
+            let dims = Some((image.width, image.height));
             match action {
                 Action::Save => {
                     if !save_done {
                         save_done = true;
-                        do_save(ctx, capture, &mut out)?;
+                        do_save(ctx, image, &mut out)?;
                     }
                     Ok(())
                 }
                 Action::Clipboard => copy_image_to_clipboard(image),
+                Action::Effects(spec) => {
+                    let spec = expand_effect_spec(spec, Local::now().naive_local(), (image.width, image.height));
+                    let new = jepret_effects::apply(image, &spec);
+                    if out.saved_path.is_some() {
+                        stale_file = true;
+                        fresh_file = None;
+                    }
+                    processed = Some(new);
+                    Ok(())
+                }
+                Action::Ocr => {
+                    let text = jepret_ocr::recognize(image)?;
+                    out.notification = Some(ocr_notification(&text));
+                    if !text.trim().is_empty() {
+                        copy_text(&text)?;
+                    }
+                    Ok(())
+                }
                 Action::Notify => {
                     out.notification = Some(match &out.saved_path {
                         Some(p) => format!("Saved {}", file_name(p)),
@@ -83,12 +116,22 @@ pub fn run(
                     });
                     Ok(())
                 }
+                _ if stale_file => {
+                    // `effects` ran after a file was written: use a fresh one.
+                    if fresh_file.is_none() {
+                        let p = temp_path(ctx.config.general.image_format.extension())?;
+                        write_image(image, &p, ctx.config)?;
+                        fresh_file = Some(p);
+                    }
+                    let path = fresh_file.clone().context("no file")?;
+                    run_file_action(ctx, &path, dims, action, &mut out)
+                }
                 _ => {
                     // needs a file: make sure there is one
                     if out.saved_path.is_none() {
                         if actions.contains(&Action::Save) && !save_done {
                             save_done = true;
-                            if let Err(e) = do_save(ctx, capture, &mut out) {
+                            if let Err(e) = do_save(ctx, image, &mut out) {
                                 out.errors.push(("save".into(), format!("{e:#}")));
                             }
                         }
@@ -112,6 +155,38 @@ pub fn run(
     Ok(out)
 }
 
+/// Expand `{date}`, `{time}`, `{datetime}`, `{width}`, `{height}` in the
+/// watermark text. Pure; unit-tested.
+pub fn expand_effect_spec(
+    spec: &jepret_core::EffectSpec,
+    now: NaiveDateTime,
+    dims: (u32, u32),
+) -> jepret_core::EffectSpec {
+    let mut spec = spec.clone();
+    if let Some(w) = spec.watermark.as_mut() {
+        let mut vars = time_vars(now);
+        vars.push(("width", dims.0.to_string()));
+        vars.push(("height", dims.1.to_string()));
+        w.text = template::expand(&w.text, &vars);
+    }
+    spec
+}
+
+/// Notification text for the OCR result. Pure; unit-tested.
+pub fn ocr_notification(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        return "Tidak ada teks terdeteksi".into();
+    }
+    let mut chars = flat.chars();
+    let head: String = chars.by_ref().take(40).collect();
+    if chars.next().is_some() {
+        format!("Teks disalin: {head}…")
+    } else {
+        format!("Teks disalin: {head}")
+    }
+}
+
 /// Run file-based actions for an existing file (e.g. a finished recording).
 /// `save` / `clipboard` (image) are skipped for non-images.
 pub fn run_for_file(
@@ -129,6 +204,10 @@ pub fn run_for_file(
         let label = action.label();
         let res = match action {
             Action::Save | Action::Clipboard => Ok(()),
+            Action::Ocr | Action::Effects(_) | Action::Pin => {
+                tracing::warn!(action = %label, "action only applies to images; skipped for a file");
+                Ok(())
+            }
             Action::Notify => {
                 out.notification = Some(format!("Saved {}", file_name(path)));
                 Ok(())
@@ -151,13 +230,13 @@ fn file_name(p: &Path) -> String {
 
 fn do_save(
     ctx: &WorkflowContext<'_>,
-    capture: &CaptureResult,
+    image: &jepret_core::Image,
     out: &mut WorkflowOutcome,
 ) -> Result<()> {
     let ext = ctx.config.general.image_format.extension();
-    let dims = Some((capture.image.width, capture.image.height));
+    let dims = Some((image.width, image.height));
     let path = output_path_at(ctx.config, ext, Local::now().naive_local(), dims)?;
-    write_image(&capture.image, &path, ctx.config)?;
+    write_image(image, &path, ctx.config)?;
     out.saved_path = Some(path);
     out.saved_permanently = true;
     Ok(())
@@ -182,6 +261,15 @@ fn run_file_action(
         Action::OpenEditor => {
             Command::new(&ctx.exe_path)
                 .arg("--editor")
+                .arg(path)
+                .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+                .spawn()
+                .with_context(|| format!("spawn {}", ctx.exe_path.display()))?;
+            Ok(())
+        }
+        Action::Pin => {
+            Command::new(&ctx.exe_path)
+                .arg("--pin")
                 .arg(path)
                 .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
                 .spawn()
@@ -704,6 +792,105 @@ mod tests {
         assert!(out.errors.is_empty());
         assert_eq!(out.saved_path.as_deref(), Some(f.as_path()));
         assert!(run_for_file(&ctx, &d.join("nope.mp4"), &[]).is_err());
+    }
+
+    #[test]
+    fn effect_watermark_placeholders_expand() {
+        use jepret_core::effects::Watermark;
+        let spec = jepret_core::EffectSpec {
+            watermark: Some(Watermark {
+                text: "{date} {time} {width}x{height} {datetime}".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let out = expand_effect_spec(&spec, now(), (4, 3));
+        assert_eq!(
+            out.watermark.unwrap().text,
+            "2026-03-05 14-07-09 4x3 2026-03-05_14-07-09"
+        );
+        // no watermark: untouched
+        assert_eq!(
+            expand_effect_spec(&Default::default(), now(), (1, 1)),
+            Default::default()
+        );
+    }
+
+    #[test]
+    fn ocr_notification_text() {
+        assert_eq!(ocr_notification(""), "Tidak ada teks terdeteksi");
+        assert_eq!(ocr_notification("  
+ "), "Tidak ada teks terdeteksi");
+        assert_eq!(ocr_notification("halo
+dunia"), "Teks disalin: halo dunia");
+        let long = "a".repeat(60);
+        assert_eq!(
+            ocr_notification(&long),
+            format!("Teks disalin: {}…", "a".repeat(40))
+        );
+    }
+
+    #[test]
+    fn new_actions_labels_and_file_needs() {
+        assert_eq!(Action::Ocr.label(), "ocr");
+        assert_eq!(Action::Pin.label(), "pin");
+        assert!(Action::Pin.needs_file());
+        assert!(!Action::Ocr.needs_file());
+        assert!(!Action::Effects(Default::default()).needs_file());
+    }
+
+    /// With a no-op spec the processed image is what gets saved (same size
+    /// whether `jepret-effects` is the stub or real). The grown-by-shadow
+    /// size is asserted in `effects_shadow_grows_saved_image`.
+    #[test]
+    fn effects_then_save_uses_processed_image() {
+        let d = tmp("fx");
+        let c = cfg(&d);
+        let ctx = WorkflowContext { config: &c, exe_path: PathBuf::from("jepret.exe") };
+        let out = run(&ctx, &capture(), &[Action::Effects(Default::default()), Action::Save]).unwrap();
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let back = image::open(out.saved_path.unwrap()).unwrap();
+        assert_eq!((back.width(), back.height()), (4, 3));
+    }
+
+    #[test]
+    fn effects_shadow_grows_saved_image() {
+        let d = tmp("fxs");
+        let c = cfg(&d);
+        let ctx = WorkflowContext { config: &c, exe_path: PathBuf::from("jepret.exe") };
+        let spec = jepret_core::EffectSpec { shadow_blur: 8, ..Default::default() };
+        let out = run(&ctx, &capture(), &[Action::Effects(spec), Action::Save]).unwrap();
+        let back = image::open(out.saved_path.unwrap()).unwrap();
+        assert!(back.width() > 4 && back.height() > 3);
+    }
+
+    #[test]
+    fn ocr_failure_is_recorded_not_fatal() {
+        let d = tmp("ocrf");
+        let c = cfg(&d);
+        let ctx = WorkflowContext { config: &c, exe_path: PathBuf::from("jepret.exe") };
+        // Works with the stub (error) and with the real engine (text or none,
+        // clipboard may fail headless): the run itself succeeds and later
+        // actions still run.
+        let out = run(&ctx, &capture(), &[Action::Ocr, Action::Notify]).unwrap();
+        assert!(out.errors.iter().all(|(l, _)| l == "ocr"));
+        assert!(out.notification.is_some());
+    }
+
+    #[test]
+    fn run_for_file_skips_image_only_actions() {
+        let d = tmp("rffx");
+        let c = cfg(&d);
+        let ctx = WorkflowContext { config: &c, exe_path: PathBuf::from("jepret.exe") };
+        let f = d.join("v.mp4");
+        std::fs::write(&f, b"x").unwrap();
+        let out = run_for_file(
+            &ctx,
+            &f,
+            &[Action::Ocr, Action::Pin, Action::Effects(Default::default())],
+        )
+        .unwrap();
+        assert!(out.errors.is_empty());
     }
 
     #[test]

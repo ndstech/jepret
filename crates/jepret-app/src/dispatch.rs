@@ -91,6 +91,14 @@ pub fn stop_recording() -> bool {
 
 // ---------------------------------------------------------------- entry point
 
+/// Longest capture delay honoured (matches the settings UI range).
+pub const MAX_DELAY_SECS: u32 = 30;
+
+/// Delay to sleep before capturing; `None` for 0. Clamped to [`MAX_DELAY_SECS`].
+pub fn delay_duration(secs: u32) -> Option<std::time::Duration> {
+    (secs > 0).then(|| std::time::Duration::from_secs(secs.min(MAX_DELAY_SECS) as u64))
+}
+
 pub fn handle(ctx: &Ctx<'_>, kind: CaptureKind, actions: &[Action]) -> anyhow::Result<()> {
     if kind.is_recording() {
         return record(ctx, kind, actions);
@@ -559,6 +567,13 @@ mod tests {
         let last = LastRegion { rect: Rect::new(5000, 5000, 50, 50), monitor: None };
         let ms = [mon("A", Rect::new(0, 0, 1920, 1080))];
         assert!(matches!(decide_last_region(Some(&last), &ms), LastResolution::Fallback(Some(_))));
+    }
+
+    #[test]
+    fn delay_is_clamped() {
+        assert_eq!(delay_duration(0), None);
+        assert_eq!(delay_duration(3), Some(std::time::Duration::from_secs(3)));
+        assert_eq!(delay_duration(999), Some(std::time::Duration::from_secs(30)));
     }
 
     #[test]

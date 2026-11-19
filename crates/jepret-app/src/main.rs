@@ -6,6 +6,7 @@
 //!   jepret --editor <file>       → editor process
 //!   jepret --gallery             → gallery process
 //!   jepret --settings            → settings process
+//!   jepret --pin <file>          → pin window (always-on-top image)
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -37,6 +38,10 @@ fn main() -> anyhow::Result<()> {
             let file = PathBuf::from(args.get(1).ok_or_else(|| anyhow::anyhow!("--editor <file>"))?);
             let config = Config::load(&config_path)?;
             jepret_editor::run_editor(&file, &config)
+        }
+        Some("--pin") => {
+            let file = PathBuf::from(args.get(1).ok_or_else(|| anyhow::anyhow!("--pin <file>"))?);
+            jepret_pin::run_pin(&file, &config_path)
         }
         Some("--gallery") => {
             let config = Config::load(&config_path)?;

@@ -11,3 +11,6 @@ jepret-ui-theme.workspace = true
 tracing.workspace = true
 ab_glyph = "0.2"
 epaint_default_fonts = "0.29"
+
+[dev-dependencies]
+image.workspace = true

@@ -20,9 +20,10 @@ use jepret_core::shortcuts::{editor_shortcut, EDITOR_SHORTCUTS};
 use jepret_ui_theme::tokens::{
     CONTROL_H, RADIUS_CONTROL, RADIUS_PANEL, SP_1, SP_2, SP_3, SP_4, TEXT_BODY, TEXT_SMALL, TOOL_BTN,
 };
-use jepret_ui_theme::widgets::{button, kbd, primary_button, toggle, IconButton};
+use jepret_ui_theme::widgets::{button, kbd, primary_button, segmented, toggle, IconButton};
 use jepret_ui_theme::{icons, Icon, Palette};
-use jepret_core::{Config, Image, Rect};
+use jepret_core::effects::{Anchor, Watermark};
+use jepret_core::{Config, EffectSpec, Image, Rect};
 
 use crate::doc::{Handle, HandleKind, Pt, Shape, ShapeKind, Tool};
 use crate::input::{combo_from_key, Keymap};
@@ -130,8 +131,14 @@ pub struct EditorApp {
     /// Handle-resize gesture in progress.
     resizing: Option<Resize>,
     prop_editing: bool,
-    /// Sidebar panel open state: PROPERTI, OBJEK, RIWAYAT, NAVIGATOR (session only).
-    panels_open: [bool; 4],
+    /// Sidebar panel open state: PROPERTI, OBJEK, RIWAYAT, EFEK, NAVIGATOR (session only).
+    panels_open: [bool; 5],
+    /// An EFEK slider drag / text edit is in progress (its undo point exists).
+    eff_editing: bool,
+    /// Zoom given to newly drawn magnifiers.
+    magnify_zoom: f32,
+    /// Dimming layer of the spotlights: content hash + texture (downscaled).
+    spot_cache: Option<(u64, TextureHandle)>,
     /// Object under the pointer in the OBJEK list (highlighted on the canvas).
     hover_obj: Option<usize>,
     /// Doc index of the list row being dragged to reorder.
@@ -202,7 +209,10 @@ impl EditorApp {
             frames: 0,
             resizing: None,
             prop_editing: false,
-            panels_open: [true; 4],
+            panels_open: [true, true, true, false, true],
+            eff_editing: false,
+            magnify_zoom: crate::doc::MAGNIFY_DEFAULT_ZOOM,
+            spot_cache: None,
             hover_obj: None,
             obj_drag: None,
             zoom: 1.0,
@@ -273,7 +283,7 @@ impl EditorApp {
     fn flatten(&self) -> Option<Image> {
         let base = self.base.as_ref()?;
         let t = Instant::now();
-        let out = render::flatten(base, &self.s.doc);
+        let out = render::export(base, &self.s.doc, chrono::Local::now().naive_local());
         tracing::debug!("editor: flatten {}x{} in {:?}", out.width, out.height, t.elapsed());
         Some(out)
     }
@@ -767,6 +777,8 @@ impl EditorApp {
                 "{name} · klik titik-titik, klik titik awal/Enter = selesai, Backspace = hapus titik, Esc = batal"
             ),
             Tool::Callout => format!("{name} · drag dari titik yang ditunjuk ke posisi balon"),
+            Tool::Spotlight => format!("{name} · drag area yang tetap terang, sisanya digelapkan · Shift = persegi · Alt = dari tengah · F = elips"),
+            Tool::Magnify => format!("{name} · drag dari pusat ke tepi lingkaran · zoom diatur di Properti"),
             Tool::Crop => format!("{name} · drag area, Enter = terapkan, Esc = batal"),
             _ => name.to_string(),
         }
@@ -876,11 +888,13 @@ impl EditorApp {
                     let top = ui.cursor().top();
                     self.properties_panel(ui, ctx, total * 0.6);
                     let used = ui.cursor().top() - top;
-                    let nav_h = HEAD_H + 1.0 + if self.panels_open[3] { NAV_BODY_H } else { 0.0 };
+                    let nav_h = HEAD_H + 1.0 + if self.panels_open[4] { NAV_BODY_H } else { 0.0 };
+                    let eff_h = HEAD_H + 1.0 + if self.panels_open[3] { EFF_BODY_H } else { 0.0 };
                     let hist_h = HEAD_H + 1.0 + if self.panels_open[2] { HIST_BODY_H } else { 0.0 };
-                    let obj_h = (total - used - nav_h - hist_h).max(OBJ_MIN_H);
+                    let obj_h = (total - used - nav_h - hist_h - eff_h).max(OBJ_MIN_H);
                     self.objects_panel(ui, ctx, obj_h);
                     self.history_panel(ui);
+                    self.effects_panel(ui, ctx);
                     self.navigator_panel(ui, ctx);
                 });
             });
@@ -921,6 +935,20 @@ impl EditorApp {
         // Crop has no style; keep the panel quiet until something is selected.
         if self.s.tool == Tool::Crop && self.s.selection().is_empty() {
             ui.label(egui::RichText::new("Crop tidak punya properti").size(TEXT_SMALL).color(pal.muted));
+            return;
+        }
+        if self.targets_kind(Tool::Spotlight) {
+            ui.label(
+                egui::RichText::new("Area di luar sorotan digelapkan. Semua sorotan berbagi satu lapisan gelap.")
+                    .size(TEXT_SMALL)
+                    .color(pal.muted),
+            );
+            ui.add_space(SP_2);
+            let mut round = self.s.fill_now();
+            let h = self.sc("style.toggle_fill");
+            if toggle(ui, &pal, &mut round, "Bulat (elips)", h.as_deref()).changed() {
+                self.s.apply_fill(round);
+            }
             return;
         }
         let palette = self.s.palette.clone();
@@ -1036,6 +1064,165 @@ impl EditorApp {
         }
         if c_ol {
             self.s.apply_outline(ol);
+        }
+
+        if self.targets_kind(Tool::Magnify) {
+            ui.add_space(SP_2);
+            ui.label(egui::RichText::new("Zoom").size(TEXT_SMALL).color(pal.muted));
+            let sel = self.s.selection().first().copied().and_then(|i| match self.s.doc.shapes().get(i).map(|s| &s.kind) {
+                Some(ShapeKind::Magnify { zoom, .. }) => Some((i, *zoom)),
+                _ => None,
+            });
+            let cur = sel.map_or(self.magnify_zoom, |(_, z)| z);
+            let mut idx = crate::doc::MAGNIFY_ZOOMS.iter().position(|z| (z - cur).abs() < 0.01).unwrap_or(1);
+            if segmented(ui, &pal, &mut idx, &["1.5×", "2×", "3×", "4×"]).changed() {
+                let z = crate::doc::MAGNIFY_ZOOMS.get(idx).copied().unwrap_or(crate::doc::MAGNIFY_DEFAULT_ZOOM);
+                self.magnify_zoom = z;
+                if let Some((i, _)) = sel {
+                    self.s.doc.edit_shape(i, |sh| {
+                        if let ShapeKind::Magnify { zoom, .. } = &mut sh.kind {
+                            *zoom = z;
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    /// Is the first selected shape of `tool`'s kind, or (nothing selected)
+    /// is `tool` the active tool?
+    fn targets_kind(&self, tool: Tool) -> bool {
+        match self.s.selection().first() {
+            Some(i) => self.s.doc.shapes().get(*i).is_some_and(|s| s.kind.tool() == tool),
+            None => self.s.style_tool() == tool,
+        }
+    }
+
+    /// EFEK: output effects stored in the document (undoable, applied after
+    /// crop + annotations on copy/save). Collapsed by default.
+    fn effects_panel(&mut self, ui: &mut egui::Ui, ctx: &Context) {
+        let pal = self.pal;
+        self.side_sep(ui);
+        let active = !self.s.doc.effects().is_noop();
+        let (_, clicked) = panel_header(ui, &pal, self.panels_open[3], "Efek", if active { "aktif" } else { "" }, 0.0);
+        if clicked {
+            self.panels_open[3] = !self.panels_open[3];
+        }
+        if !self.panels_open[3] {
+            return;
+        }
+        self.side_sep(ui);
+        let orig = self.s.doc.effects().clone();
+        let mut spec = orig.clone();
+        let palette = self.s.palette.clone();
+        let mut text_focus = false;
+        egui::Frame::none().inner_margin(egui::Margin { left: SP_3, right: SP_3, top: SP_2, bottom: SP_3 }).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing = vec2(SP_1, SP_1);
+            let sub = |ui: &mut egui::Ui, t: &str| {
+                ui.add_space(SP_1);
+                ui.label(egui::RichText::new(t).size(TEXT_SMALL).strong().color(pal.muted));
+            };
+            // Sudut membulat
+            sub(ui, "Sudut membulat");
+            let mut v = spec.corner_radius as f32;
+            if slider_row(ui, &pal, &mut v, 0.0, 48.0, " px") {
+                spec.corner_radius = v.round() as u32;
+            }
+            // Bingkai
+            sub(ui, "Bingkai");
+            let mut v = spec.border_width as f32;
+            if slider_row(ui, &pal, &mut v, 0.0, 20.0, " px") {
+                spec.border_width = v.round() as u32;
+            }
+            if spec.border_width > 0 {
+                let cell = ((ui.available_width() - 8.0 * SP_1) / 9.0).floor();
+                let cur = crate::session::parse_hex_color(&spec.border_color);
+                ui.horizontal(|ui| {
+                    for c in palette.iter().take(9) {
+                        let (rect, resp) = ui.allocate_exact_size(vec2(cell, 22.0), Sense::click());
+                        let on = cur.is_some_and(|k| k[..3] == c[..3]);
+                        let stroke = if on { Stroke::new(2.0_f32, pal.text) } else { Stroke::new(1.0_f32, pal.line) };
+                        ui.painter().rect(rect, RADIUS_CONTROL, Color32::from_rgb(c[0], c[1], c[2]), stroke);
+                        if resp.clicked() {
+                            spec.border_color = format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
+                        }
+                    }
+                });
+            }
+            // Bayangan
+            sub(ui, "Bayangan");
+            let mut on = spec.shadow_blur > 0;
+            if toggle(ui, &pal, &mut on, "Aktif", None).changed() {
+                spec.shadow_blur = if on { 12 } else { 0 };
+            }
+            if spec.shadow_blur > 0 {
+                let mut v = spec.shadow_blur as f32;
+                ui.label(egui::RichText::new("Blur").size(TEXT_SMALL).color(pal.muted));
+                if slider_row(ui, &pal, &mut v, 1.0, 40.0, " px") {
+                    spec.shadow_blur = v.round() as u32;
+                }
+                let mut v = spec.shadow_offset_y as f32;
+                ui.label(egui::RichText::new("Geser ke bawah").size(TEXT_SMALL).color(pal.muted));
+                if slider_row(ui, &pal, &mut v, 0.0, 30.0, " px") {
+                    spec.shadow_offset_y = v.round() as i32;
+                }
+            }
+            // Tepi sobek
+            sub(ui, "Tepi sobek");
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut spec.torn.top, "Atas");
+                ui.checkbox(&mut spec.torn.right, "Kanan");
+                ui.checkbox(&mut spec.torn.bottom, "Bawah");
+                ui.checkbox(&mut spec.torn.left, "Kiri");
+            });
+            if spec.torn.any() {
+                let mut v = spec.torn_size as f32;
+                ui.label(egui::RichText::new("Ukuran gerigi").size(TEXT_SMALL).color(pal.muted));
+                if slider_row(ui, &pal, &mut v, 2.0, 40.0, " px") {
+                    spec.torn_size = v.round() as u32;
+                }
+            }
+            // Watermark
+            sub(ui, "Watermark");
+            let orig_wm = spec.watermark.clone();
+            let mut wm = orig_wm.clone().unwrap_or_default();
+            let te = ui.add(
+                egui::TextEdit::singleline(&mut wm.text)
+                    .hint_text("Teks, mis. {date} {time}")
+                    .desired_width(f32::INFINITY),
+            );
+            text_focus = te.has_focus();
+            ui.label(egui::RichText::new("Posisi").size(TEXT_SMALL).color(pal.muted));
+            anchor_picker(ui, &pal, &mut wm.position);
+            let mut v = wm.size as f32;
+            ui.label(egui::RichText::new("Ukuran").size(TEXT_SMALL).color(pal.muted));
+            if slider_row(ui, &pal, &mut v, 8.0, 96.0, " px") {
+                wm.size = v.round() as u32;
+            }
+            let mut v = wm.opacity as f32;
+            ui.label(egui::RichText::new("Opasitas").size(TEXT_SMALL).color(pal.muted));
+            if slider_row(ui, &pal, &mut v, 10.0, 100.0, "%") {
+                wm.opacity = v.round() as u8;
+            }
+            if Some(&wm) != orig_wm.as_ref() && !(orig_wm.is_none() && wm == Watermark::default()) {
+                spec.watermark = Some(wm);
+            }
+            ui.add_space(SP_2);
+            if button(ui, &pal, None, "Reset efek", None).clicked() {
+                spec = EffectSpec::default();
+            }
+        });
+        if spec != orig {
+            if !self.eff_editing {
+                self.s.doc.begin_edit();
+                self.eff_editing = true;
+            }
+            *self.s.doc.effects_live() = spec;
+        }
+        // One undo step per drag / typing session.
+        if self.eff_editing && !text_focus && ctx.input(|i| !i.pointer.any_down()) {
+            self.eff_editing = false;
         }
     }
 
@@ -1328,11 +1515,11 @@ impl EditorApp {
         let pal = self.pal;
         self.side_sep(ui);
         let zoom_txt = format!("{:.0}%", self.zoom * ctx.pixels_per_point() * 100.0);
-        let (_, clicked) = panel_header(ui, &pal, self.panels_open[3], "Navigator", &zoom_txt, 0.0);
+        let (_, clicked) = panel_header(ui, &pal, self.panels_open[4], "Navigator", &zoom_txt, 0.0);
         if clicked {
-            self.panels_open[3] = !self.panels_open[3];
+            self.panels_open[4] = !self.panels_open[4];
         }
-        if !self.panels_open[3] {
+        if !self.panels_open[4] {
             return;
         }
         let w = ui.available_width();
@@ -1733,12 +1920,23 @@ impl EditorApp {
                     .as_shape(vis_rect, 2.0),
                 );
                 let ui_painter = painter.clone();
+                self.paint_effects_shadow(&ui_painter, vis_rect, zoom);
                 let painter = if cropped_view { painter.with_clip_rect(rect.intersect(vis_rect)) } else { painter };
                 painter.rect_filled(img_rect, 0.0, pal.surface);
                 painter.image(tex.id(), img_rect, ERect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
 
                 self.effect_used.clear();
                 let shapes: Vec<Shape> = self.s.doc.shapes().to_vec();
+                // Spotlights share one dimming layer, drawn right above the
+                // topmost spotlight (or on top while one is being drawn).
+                let spot_tex = self.spot_mask(ctx, &shapes, iw, ih);
+                let last_spot = shapes.iter().rposition(|s| matches!(s.kind, ShapeKind::Spotlight { .. }));
+                let drawing_spot = matches!(self.drawing.as_ref().map(|d| &d.kind), Some(ShapeKind::Spotlight { .. }));
+                let paint_spots = |painter: &egui::Painter| {
+                    if let Some(id) = spot_tex {
+                        painter.image(id, img_rect, ERect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                    }
+                };
                 let editing = self.text_edit.as_ref().map(|te| (te.editing, te.text.clone()));
                 for (i, sh) in shapes.iter().enumerate() {
                     if let Some((Some(ei), text)) = &editing {
@@ -1753,6 +1951,12 @@ impl EditorApp {
                     }
                     let skip_effect = self.moving && self.s.is_selected(i);
                     self.paint_shape(ctx, &painter, &base, sh, &to_screen, zoom, skip_effect);
+                    if last_spot == Some(i) && !drawing_spot {
+                        paint_spots(&painter);
+                    }
+                }
+                if drawing_spot {
+                    paint_spots(&painter);
                 }
                 if let Some(live) = self.live_text_shape().filter(|_| matches!(&editing, Some((None, _)))) {
                     self.paint_text_shape(ctx, &painter, &live, &to_screen, zoom, true);
@@ -1796,6 +2000,8 @@ impl EditorApp {
                         painter.circle(sp, if k == 0 { 5.0 } else { 3.0 }, Color32::WHITE, Stroke::new(1.5_f32, pal.accent));
                     }
                 }
+
+                self.paint_effects_overlay(&painter, vis_rect, zoom, (vw as u32, vh as u32));
 
                 if let Some(sh) = self.hover_obj.and_then(|i| shapes.get(i)) {
                     let (min, max) = sh.bounds();
@@ -2087,6 +2293,8 @@ impl EditorApp {
             Tool::Highlight => Some(ShapeKind::Highlight { a: p, b: p }),
             Tool::Blur => Some(ShapeKind::Blur { a: p, b: p }),
             Tool::Pixelate => Some(ShapeKind::Pixelate { a: p, b: p }),
+            Tool::Spotlight => Some(ShapeKind::Spotlight { a: p, b: p }),
+            Tool::Magnify => Some(ShapeKind::Magnify { center: p, radius: 0.0, zoom: self.magnify_zoom }),
             Tool::Pen => Some(ShapeKind::Pen { points: vec![p] }),
             Tool::TextBox => Some(ShapeKind::TextBox { a: p, b: p, text: String::new() }),
             Tool::Callout => Some(ShapeKind::Callout { tip: p, a: p, b: p, text: String::new() }),
@@ -2128,8 +2336,14 @@ impl EditorApp {
                 | ShapeKind::Highlight { a, b }
                 | ShapeKind::Blur { a, b }
                 | ShapeKind::Pixelate { a, b }
+                | ShapeKind::Spotlight { a, b }
                 | ShapeKind::TextBox { a, b, .. } => {
                     (*a, *b) = constrain_drag(DragKind::Boxed, start, p, mods.shift, mods.alt);
+                }
+                // Drag from the centre outwards: the radius follows the pointer.
+                ShapeKind::Magnify { center, radius, .. } => {
+                    *center = start;
+                    *radius = start.dist(p);
                 }
                 // The drag end is the bubble corner nearest the tip; the
                 // bubble grows away from the tip (auto width until resized).
@@ -2191,7 +2405,9 @@ impl EditorApp {
             | ShapeKind::Ellipse { a, b }
             | ShapeKind::Highlight { a, b }
             | ShapeKind::Blur { a, b }
+            | ShapeKind::Spotlight { a, b }
             | ShapeKind::Pixelate { a, b } => a.dist(*b) >= 3.0,
+            ShapeKind::Magnify { radius, .. } => *radius >= 3.0,
             _ => true,
         };
         if big_enough {
@@ -2305,6 +2521,158 @@ impl EditorApp {
         }
     }
 
+    /// Dimming layer of all spotlights (plus the one being drawn) as a
+    /// downscaled black-with-alpha texture, rebuilt only when they change.
+    fn spot_mask(&mut self, ctx: &Context, shapes: &[Shape], iw: f32, ih: f32) -> Option<egui::TextureId> {
+        let mut spots: Vec<Shape> =
+            shapes.iter().filter(|s| matches!(s.kind, ShapeKind::Spotlight { .. })).cloned().collect();
+        if let Some(d) = &self.drawing {
+            if let ShapeKind::Spotlight { a, b } = &d.kind {
+                if a.dist(*b) >= 3.0 {
+                    spots.push(d.clone());
+                }
+            }
+        }
+        if spots.is_empty() || iw < 1.0 || ih < 1.0 {
+            self.spot_cache = None;
+            return None;
+        }
+        let key = {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (iw.to_bits(), ih.to_bits()).hash(&mut h);
+            for sp in &spots {
+                if let ShapeKind::Spotlight { a, b } = &sp.kind {
+                    for v in [a.x, a.y, b.x, b.y] {
+                        v.to_bits().hash(&mut h);
+                    }
+                }
+                sp.fill.hash(&mut h);
+            }
+            h.finish()
+        };
+        if self.spot_cache.as_ref().is_none_or(|(k, _)| *k != key) {
+            let k = (SPOT_MASK_MAX / iw.max(ih)).min(1.0);
+            let (mw, mh) = (((iw * k).ceil() as u32).max(1), ((ih * k).ceil() as u32).max(1));
+            let mut mask = Image::new(mw, mh);
+            for sp in &mut spots {
+                sp.scale(k);
+            }
+            render::dim_outside_spotlights(&mut mask, &spots);
+            let ci = ColorImage::from_rgba_unmultiplied([mw as usize, mh as usize], &mask.pixels);
+            self.spot_cache = Some((key, ctx.load_texture("jepret-spot", ci, TextureOptions::LINEAR)));
+        }
+        self.spot_cache.as_ref().map(|(_, t)| t.id())
+    }
+
+    /// EFEK preview, part 1: the drop shadow behind the image (egui shadow).
+    fn paint_effects_shadow(&self, painter: &egui::Painter, vis: ERect, zoom: f32) {
+        let spec = self.s.doc.effects();
+        if spec.shadow_blur == 0 {
+            return;
+        }
+        let c = jepret_core::effects::parse_hex_color(&spec.shadow_color).unwrap_or([0, 0, 0, 102]);
+        painter.add(
+            egui::epaint::Shadow {
+                offset: vec2(spec.shadow_offset_x as f32, spec.shadow_offset_y as f32) * zoom,
+                blur: spec.shadow_blur as f32 * zoom,
+                spread: 0.0,
+                color: Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]),
+            }
+            .as_shape(vis, spec.corner_radius as f32 * zoom),
+        );
+    }
+
+    /// EFEK preview, part 2 (cheap approximation, never runs `apply`):
+    /// rounded corners = canvas-coloured corner masks, border = rounded
+    /// stroke, torn edges = orange zigzag guide, watermark = egui text.
+    /// The canvas does not grow for the shadow margin; export does.
+    fn paint_effects_overlay(&self, painter: &egui::Painter, vis: ERect, zoom: f32, dims: (u32, u32)) {
+        let spec = self.s.doc.effects();
+        if spec.is_noop() {
+            return;
+        }
+        let pal = self.pal;
+        let r = (spec.corner_radius as f32 * zoom).min(vis.width().min(vis.height()) / 2.0);
+        if r >= 1.0 {
+            use std::f32::consts::{FRAC_PI_2, PI};
+            let corners = [
+                (vis.left_top(), vec2(r, r), PI),
+                (vis.right_top(), vec2(-r, r), PI * 1.5),
+                (vis.right_bottom(), vec2(-r, -r), 0.0),
+                (vis.left_bottom(), vec2(r, -r), FRAC_PI_2),
+            ];
+            for (p, to_centre, a0) in corners {
+                let centre = p + to_centre;
+                let mut mesh = egui::Mesh::default();
+                mesh.colored_vertex(p, pal.canvas);
+                const SEG: u32 = 10;
+                for k in 0..=SEG {
+                    let t = a0 + FRAC_PI_2 * k as f32 / SEG as f32;
+                    mesh.colored_vertex(centre + vec2(t.cos(), t.sin()) * r, pal.canvas);
+                }
+                for k in 0..SEG {
+                    mesh.add_triangle(0, 1 + k, 2 + k);
+                }
+                painter.add(EShape::mesh(mesh));
+            }
+        }
+        if spec.border_width > 0 {
+            let c = jepret_core::effects::parse_hex_color(&spec.border_color).unwrap_or([0, 0, 0, 255]);
+            let bw = spec.border_width as f32 * zoom;
+            painter.rect_stroke(
+                vis.shrink(bw / 2.0),
+                (r - bw / 2.0).max(0.0),
+                Stroke::new(bw, Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])),
+            );
+        }
+        if spec.torn.any() {
+            let tooth = (spec.torn_size as f32 * zoom).max(3.0);
+            let st = Stroke::new(1.5_f32, Color32::from_rgb(255, 150, 0));
+            let zig = |a: Pos2, b: Pos2, normal: Vec2| {
+                let n = (((b - a).length() / tooth).round() as usize).clamp(2, 400);
+                let pts: Vec<Pos2> = (0..=n)
+                    .map(|k| {
+                        let t = k as f32 / n as f32;
+                        a + (b - a) * t + if k % 2 == 1 { normal * tooth } else { Vec2::ZERO }
+                    })
+                    .collect();
+                painter.add(EShape::line(pts, st));
+            };
+            if spec.torn.top {
+                zig(vis.left_top(), vis.right_top(), vec2(0.0, 1.0));
+            }
+            if spec.torn.bottom {
+                zig(vis.left_bottom(), vis.right_bottom(), vec2(0.0, -1.0));
+            }
+            if spec.torn.left {
+                zig(vis.left_top(), vis.left_bottom(), vec2(1.0, 0.0));
+            }
+            if spec.torn.right {
+                zig(vis.right_top(), vis.right_bottom(), vec2(-1.0, 0.0));
+            }
+        }
+        let expanded = render::expand_effects(spec, chrono::Local::now().naive_local(), dims);
+        if let Some(w) = expanded.watermark.filter(|w| !w.text.trim().is_empty()) {
+            let m = w.margin as f32 * zoom;
+            let (l, rt, t, b, cx, cy) = (vis.left() + m, vis.right() - m, vis.top() + m, vis.bottom() - m, vis.center().x, vis.center().y);
+            let (pos, align) = match w.position {
+                Anchor::TopLeft => (pos2(l, t), Align2::LEFT_TOP),
+                Anchor::Top => (pos2(cx, t), Align2::CENTER_TOP),
+                Anchor::TopRight => (pos2(rt, t), Align2::RIGHT_TOP),
+                Anchor::Left => (pos2(l, cy), Align2::LEFT_CENTER),
+                Anchor::Center => (pos2(cx, cy), Align2::CENTER_CENTER),
+                Anchor::Right => (pos2(rt, cy), Align2::RIGHT_CENTER),
+                Anchor::BottomLeft => (pos2(l, b), Align2::LEFT_BOTTOM),
+                Anchor::Bottom => (pos2(cx, b), Align2::CENTER_BOTTOM),
+                Anchor::BottomRight => (pos2(rt, b), Align2::RIGHT_BOTTOM),
+            };
+            let c = jepret_core::effects::parse_hex_color(&w.color).unwrap_or([255, 255, 255, 255]);
+            let a = (c[3] as f32 * w.opacity.min(100) as f32 / 100.0).round() as u8;
+            let size = (w.size as f32 * zoom * render::egui_font_factor()).max(4.0);
+            painter.text(pos, align, &w.text, FontId::proportional(size), Color32::from_rgba_unmultiplied(c[0], c[1], c[2], a));
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn paint_shape(
         &mut self,
@@ -2404,6 +2772,44 @@ impl EditorApp {
                 }
             }
             ShapeKind::Text { .. } | ShapeKind::TextBox { .. } | ShapeKind::Callout { .. } => {}
+            // The dimming itself is one shared texture (see `spot_mask`); only
+            // while drawing / moving do we add a thin outline for feedback.
+            ShapeKind::Spotlight { .. } => {
+                if skip_effect {
+                    let (min, max) = s.bounds();
+                    let r = ERect::from_min_max(to_screen(min), to_screen(max));
+                    let st = Stroke::new(1.0_f32, Color32::WHITE);
+                    if s.fill {
+                        painter.add(EShape::closed_line(ellipse_pts(r), st));
+                    } else {
+                        painter.rect_stroke(r, 0.0, st);
+                    }
+                }
+            }
+            // Live preview: the base texture mapped (zoomed) onto a disc.
+            ShapeKind::Magnify { center, radius, zoom: mz } => {
+                let r = radius.max(1.0);
+                let (iw, ih) = (base.width.max(1) as f32, base.height.max(1) as f32);
+                if let Some(tex) = &self.tex {
+                    let uv = |q: Pt| pos2((q.x / iw).clamp(0.0, 1.0), (q.y / ih).clamp(0.0, 1.0));
+                    let mut mesh = egui::Mesh::with_texture(tex.id());
+                    let vtx = |pos: Pos2, uv: Pos2| egui::epaint::Vertex { pos, uv, color: Color32::WHITE };
+                    mesh.vertices.push(vtx(to_screen(*center), uv(*center)));
+                    const N: u32 = 64;
+                    for k in 0..N {
+                        let t = k as f32 / N as f32 * std::f32::consts::TAU;
+                        let d = Pt::new(t.cos(), t.sin());
+                        let edge = Pt::new(center.x + d.x * r, center.y + d.y * r);
+                        let src = Pt::new(center.x + d.x * r / mz.max(1.0), center.y + d.y * r / mz.max(1.0));
+                        mesh.vertices.push(vtx(to_screen(edge), uv(src)));
+                    }
+                    for k in 0..N {
+                        mesh.add_triangle(0, 1 + k, 1 + (k + 1) % N);
+                    }
+                    painter.add(EShape::mesh(mesh));
+                }
+                painter.circle_stroke(to_screen(*center), ((r - w / 2.0) * zoom).max(0.5), stroke);
+            }
             ShapeKind::Polygon { points } => {
                 let pts: Vec<Pos2> = points.iter().map(|p| to_screen(*p)).collect();
                 if pts.len() >= 3 {
@@ -2463,6 +2869,8 @@ const ROW_H: f32 = 30.0;
 /// Fixed height of the RIWAYAT list.
 const HIST_BODY_H: f32 = 160.0;
 const NAV_BODY_H: f32 = 2.0 + 136.0 + SP_3;
+/// Approximate height of the open EFEK body (only used to size OBJEK).
+const EFF_BODY_H: f32 = 430.0;
 /// Smallest OBJEK region (header + a couple of rows + footer) before the
 /// sidebar falls back to scrolling.
 const OBJ_MIN_H: f32 = HEAD_H + 2.0 * ROW_H + 40.0;
@@ -2529,20 +2937,25 @@ fn paint_order_glyph(p: &egui::Painter, r: ERect, front: bool, col: Color32) {
 /// Returns true when the value changed.
 fn width_slider(ui: &mut egui::Ui, pal: &Palette, value: &mut f32) -> bool {
     use crate::session::{MAX_WIDTH, MIN_WIDTH};
+    range_slider(ui, pal, value, MIN_WIDTH, MAX_WIDTH)
+}
+
+/// [`width_slider`] over an arbitrary `lo..=hi`.
+fn range_slider(ui: &mut egui::Ui, pal: &Palette, value: &mut f32, lo: f32, hi: f32) -> bool {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 16.0), Sense::click_and_drag());
     let (l, r) = (rect.left() + 8.0, rect.right() - 8.0);
     let mut changed = false;
     if let Some(p) = resp.interact_pointer_pos() {
         if resp.dragged() || resp.clicked() {
             let t = ((p.x - l) / (r - l).max(1.0)).clamp(0.0, 1.0);
-            let v = MIN_WIDTH + t * (MAX_WIDTH - MIN_WIDTH);
+            let v = lo + t * (hi - lo);
             if (v - *value).abs() > f32::EPSILON {
                 *value = v;
                 changed = true;
             }
         }
     }
-    let t = ((*value - MIN_WIDTH) / (MAX_WIDTH - MIN_WIDTH)).clamp(0.0, 1.0);
+    let t = ((*value - lo) / (hi - lo)).clamp(0.0, 1.0);
     let x = l + t * (r - l);
     let y = rect.center().y;
     let p = ui.painter();
@@ -2551,6 +2964,56 @@ fn width_slider(ui: &mut egui::Ui, pal: &Palette, value: &mut f32) -> bool {
     p.circle(pos2(x, y), 8.0, pal.surface, Stroke::new(2.0_f32, pal.accent));
     changed
 }
+
+/// Closed 64-gon of the ellipse inscribed in `r` (screen space).
+fn ellipse_pts(r: ERect) -> Vec<Pos2> {
+    let (c, rad) = (r.center(), r.size() / 2.0);
+    (0..64)
+        .map(|k| {
+            let t = k as f32 / 64.0 * std::f32::consts::TAU;
+            pos2(c.x + rad.x * t.cos(), c.y + rad.y * t.sin())
+        })
+        .collect()
+}
+
+/// Label + value readout + slider on one block. Returns true when changed.
+fn slider_row(ui: &mut egui::Ui, pal: &Palette, value: &mut f32, lo: f32, hi: f32, unit: &str) -> bool {
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(egui::RichText::new(format!("{:.0}{unit}", *value)).size(TEXT_SMALL));
+        });
+    });
+    let changed = range_slider(ui, pal, value, lo, hi);
+    if changed {
+        *value = value.round().clamp(lo, hi);
+    }
+    changed
+}
+
+/// 3x3 grid to pick a watermark anchor.
+fn anchor_picker(ui: &mut egui::Ui, pal: &Palette, pos: &mut Anchor) {
+    const GRID: [[Anchor; 3]; 3] = [
+        [Anchor::TopLeft, Anchor::Top, Anchor::TopRight],
+        [Anchor::Left, Anchor::Center, Anchor::Right],
+        [Anchor::BottomLeft, Anchor::Bottom, Anchor::BottomRight],
+    ];
+    for row in GRID {
+        ui.horizontal(|ui| {
+            for a in row {
+                let (rect, resp) = ui.allocate_exact_size(vec2(26.0, 16.0), Sense::click());
+                let on = *pos == a;
+                let fill = if on { pal.accent } else if resp.hovered() { pal.line_strong } else { pal.raised };
+                ui.painter().rect(rect, 3.0, fill, Stroke::new(1.0_f32, pal.line));
+                if resp.clicked() {
+                    *pos = a;
+                }
+            }
+        });
+    }
+}
+
+/// Longest side (px) of the spotlight dimming texture.
+const SPOT_MASK_MAX: f32 = 512.0;
 
 fn make_texture(ctx: &Context, img: &Image) -> TextureHandle {
     let max = ctx.input(|i| i.max_texture_side).max(512);

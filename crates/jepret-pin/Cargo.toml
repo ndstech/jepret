@@ -7,5 +7,23 @@ license.workspace = true
 
 [dependencies]
 jepret-core.workspace = true
+jepret-ui-theme.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+eframe.workspace = true
+egui.workspace = true
+image.workspace = true
+arboard.workspace = true
+# Native Save As dialog (same as jepret-editor).
+rfd = { version = "0.15", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

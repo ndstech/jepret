@@ -3,7 +3,7 @@
 //! Pure data, no egui. All coordinates are **image pixels** (f32, origin at the
 //! top-left of the original image, regardless of zoom/pan/crop).
 
-use jepret_core::Rect;
+use jepret_core::{EffectSpec, Rect};
 
 /// Straight-alpha sRGB colour.
 pub type Rgba = [u8; 4];
@@ -41,6 +41,8 @@ pub enum Tool {
     Step,
     Pen,
     Polygon,
+    Spotlight,
+    Magnify,
     Eyedropper,
 }
 
@@ -50,7 +52,7 @@ impl Tool {
         matches!(self, Tool::Text | Tool::TextBox | Tool::Callout)
     }
 
-    pub const ALL: [Tool; 16] = [
+    pub const ALL: [Tool; 18] = [
         Tool::Select,
         Tool::Crop,
         Tool::Arrow,
@@ -66,6 +68,8 @@ impl Tool {
         Tool::Step,
         Tool::Pen,
         Tool::Polygon,
+        Tool::Spotlight,
+        Tool::Magnify,
         Tool::Eyedropper,
     ];
 
@@ -86,6 +90,8 @@ impl Tool {
             Tool::Step => "Step",
             Tool::Pen => "Pen",
             Tool::Polygon => "Polygon",
+            Tool::Spotlight => "Spotlight",
+            Tool::Magnify => "Magnify",
             Tool::Eyedropper => "Pick color",
         }
     }
@@ -108,6 +114,8 @@ impl Tool {
             Tool::Step => "tool.step",
             Tool::Pen => "tool.pen",
             Tool::Polygon => "tool.polygon",
+            Tool::Spotlight => "tool.spotlight",
+            Tool::Magnify => "tool.magnify",
             Tool::Eyedropper => "tool.eyedropper",
         }
     }
@@ -164,7 +172,25 @@ pub enum ShapeKind {
     Pen { points: Vec<Pt> },
     /// Closed polygon through `points` (>= 3); outline, or filled with `fill`.
     Polygon { points: Vec<Pt> },
+    /// Snagit-style spotlight: everything *outside* the union of all
+    /// spotlights is darkened ([`SPOTLIGHT_DIM_ALPHA`]). `a`/`b` = opposite
+    /// corners; `fill` = elliptical instead of rectangular. Only the shared
+    /// dimming is drawn (no outline). The darkening is applied once, at the
+    /// z-position of the topmost spotlight: image and shapes below it are
+    /// dimmed, shapes above it are not.
+    Spotlight { a: Pt, b: Pt },
+    /// Magnifier: a circle (`center`, `radius`) showing the *base image*
+    /// around `center` enlarged `zoom` times (annotations are not magnified),
+    /// with a border in the shape colour / width.
+    Magnify { center: Pt, radius: f32, zoom: f32 },
 }
+
+/// Black dimming applied outside the spotlights (0..=255).
+pub const SPOTLIGHT_DIM_ALPHA: u8 = 140;
+/// Selectable magnifier zoom factors.
+pub const MAGNIFY_ZOOMS: [f32; 4] = [1.5, 2.0, 3.0, 4.0];
+/// Default magnifier zoom.
+pub const MAGNIFY_DEFAULT_ZOOM: f32 = 2.0;
 
 impl ShapeKind {
     /// The text of a text-bearing shape.
@@ -206,6 +232,8 @@ impl ShapeKind {
             ShapeKind::Step { .. } => Tool::Step,
             ShapeKind::Pen { .. } => Tool::Pen,
             ShapeKind::Polygon { .. } => Tool::Polygon,
+            ShapeKind::Spotlight { .. } => Tool::Spotlight,
+            ShapeKind::Magnify { .. } => Tool::Magnify,
         }
     }
 
@@ -225,6 +253,8 @@ impl ShapeKind {
             ShapeKind::Step { .. } => "Nomor",
             ShapeKind::Pen { .. } => "Pen",
             ShapeKind::Polygon { .. } => "Polygon",
+            ShapeKind::Spotlight { .. } => "Sorotan",
+            ShapeKind::Magnify { .. } => "Kaca pembesar",
         }
     }
 }
@@ -298,8 +328,21 @@ impl Shape {
             return None;
         }
         let mut sh = match &self.kind {
-            ShapeKind::Highlight { .. } | ShapeKind::Blur { .. } | ShapeKind::Pixelate { .. } => {
-                return None
+            ShapeKind::Highlight { .. }
+            | ShapeKind::Blur { .. }
+            | ShapeKind::Pixelate { .. }
+            | ShapeKind::Spotlight { .. } => return None,
+            ShapeKind::Magnify { center, radius, .. } => {
+                let mut s = Shape::new(
+                    ShapeKind::Ellipse {
+                        a: Pt::new(center.x - radius, center.y - radius),
+                        b: Pt::new(center.x + radius, center.y + radius),
+                    },
+                    SHADOW_COLOR,
+                    0.0,
+                );
+                s.fill = true;
+                s
             }
             ShapeKind::Step { center, .. } => {
                 let r = self.step_radius();
@@ -347,6 +390,7 @@ impl Shape {
             | ShapeKind::Ellipse { a, b }
             | ShapeKind::Highlight { a, b }
             | ShapeKind::Blur { a, b }
+            | ShapeKind::Spotlight { a, b }
             | ShapeKind::Pixelate { a, b } => {
                 mv(a);
                 mv(b);
@@ -361,7 +405,7 @@ impl Shape {
                 mv(a);
                 mv(b);
             }
-            ShapeKind::Step { center, .. } => mv(center),
+            ShapeKind::Step { center, .. } | ShapeKind::Magnify { center, .. } => mv(center),
             ShapeKind::Pen { points } | ShapeKind::Polygon { points } => points.iter_mut().for_each(mv),
         }
     }
@@ -380,6 +424,7 @@ impl Shape {
             | ShapeKind::Highlight { a, b }
             | ShapeKind::Blur { a, b }
             | ShapeKind::Pixelate { a, b }
+            | ShapeKind::Spotlight { a, b }
             | ShapeKind::TextBox { a, b, .. } => {
                 sc(a);
                 sc(b);
@@ -391,6 +436,10 @@ impl Shape {
                 sc(b);
             }
             ShapeKind::Step { center, .. } => sc(center),
+            ShapeKind::Magnify { center, radius, .. } => {
+                sc(center);
+                *radius *= k;
+            }
             ShapeKind::Pen { points } | ShapeKind::Polygon { points } => points.iter_mut().for_each(sc),
         }
         self.width *= k;
@@ -408,6 +457,7 @@ impl Shape {
             | ShapeKind::Ellipse { a, b }
             | ShapeKind::Highlight { a, b }
             | ShapeKind::Blur { a, b }
+            | ShapeKind::Spotlight { a, b }
             | ShapeKind::Pixelate { a, b } => two(a, b),
             ShapeKind::Text { pos, text } => {
                 let (w, h) = crate::render::text_size(text, self.text_px());
@@ -427,6 +477,9 @@ impl Shape {
             ShapeKind::Step { center, .. } => {
                 let r = self.step_radius();
                 (Pt::new(center.x - r, center.y - r), Pt::new(center.x + r, center.y + r))
+            }
+            ShapeKind::Magnify { center, radius, .. } => {
+                (Pt::new(center.x - radius, center.y - radius), Pt::new(center.x + radius, center.y + radius))
             }
             ShapeKind::Pen { points } | ShapeKind::Polygon { points } => {
                 let mut min = Pt::new(f32::MAX, f32::MAX);
@@ -475,9 +528,11 @@ impl Shape {
                 // distance to outline ~ |f-1| * mean radius
                 (f - 1.0).abs() * (rx + ry) / 2.0 <= half
             }
+            ShapeKind::Magnify { center, radius, .. } => center.dist(p) <= radius + tol,
             ShapeKind::Highlight { .. }
             | ShapeKind::Blur { .. }
             | ShapeKind::Pixelate { .. }
+            | ShapeKind::Spotlight { .. }
             | ShapeKind::Text { .. }
             | ShapeKind::TextBox { .. } => {
                 let (min, max) = self.bounds();
@@ -627,6 +682,7 @@ impl Shape {
             | ShapeKind::Highlight { .. }
             | ShapeKind::Blur { .. }
             | ShapeKind::Pixelate { .. }
+            | ShapeKind::Spotlight { .. }
             | ShapeKind::TextBox { .. } => Some(self.bounds()),
             ShapeKind::Callout { tip, a, b, text } => {
                 let l = crate::render::callout_layout(*tip, *a, *b, text, self.text_px());
@@ -660,6 +716,7 @@ impl Shape {
             | ShapeKind::Highlight { .. }
             | ShapeKind::Blur { .. }
             | ShapeKind::Pixelate { .. }
+            | ShapeKind::Spotlight { .. }
             | ShapeKind::TextBox { .. } => {
                 let (min, max) = self.bounds();
                 box_handles(min, max)
@@ -675,6 +732,9 @@ impl Shape {
             }
             ShapeKind::Step { center, .. } => {
                 vec![Handle { pos: Pt::new(center.x + self.step_radius(), center.y), kind: HandleKind::E }]
+            }
+            ShapeKind::Magnify { center, radius, .. } => {
+                vec![Handle { pos: Pt::new(center.x + radius, center.y), kind: HandleKind::E }]
             }
             ShapeKind::Pen { points } if !points.is_empty() => {
                 let (min, max) = self.bounds();
@@ -724,6 +784,7 @@ impl Shape {
             | ShapeKind::Highlight { a, b }
             | ShapeKind::Blur { a, b }
             | ShapeKind::Pixelate { a, b }
+            | ShapeKind::Spotlight { a, b }
             | ShapeKind::TextBox { a, b, .. } => {
                 let Some((min, max)) = box_rect else { return idx };
                 let (nmin, nmax, ni) = drag_box(min, max, idx, p, keep_aspect, min_w, min_h);
@@ -747,6 +808,10 @@ impl Shape {
                     let s = ((p.x - min.x) / w + (p.y - min.y) / h) / 2.0;
                     self.width = (width * s).max(1.0);
                 }
+                idx
+            }
+            ShapeKind::Magnify { center, radius, .. } => {
+                *radius = center.dist(p).max(MIN_SIZE);
                 idx
             }
             ShapeKind::Step { center, .. } => {
@@ -836,6 +901,7 @@ pub fn seg_dist(p: Pt, a: Pt, b: Pt) -> f32 {
 struct Snapshot {
     shapes: Vec<Shape>,
     crop: Option<Rect>,
+    effects: EffectSpec,
     rev: u64,
 }
 
@@ -859,6 +925,9 @@ fn describe_step(a: &Snapshot, b: &Snapshot) -> String {
     }
     let changed: Vec<usize> = (0..sa.len()).filter(|&i| sa[i] != sb[i]).collect();
     if changed.is_empty() {
+        if a.effects != b.effects && a.crop == b.crop {
+            return "Efek".to_string();
+        }
         return match (a.crop == b.crop, b.crop) {
             (false, None) => "Reset crop".to_string(),
             (false, Some(_)) => "Crop".to_string(),
@@ -902,7 +971,7 @@ impl Default for Document {
 impl Document {
     pub fn new() -> Self {
         Self {
-            cur: Snapshot { shapes: Vec::new(), crop: None, rev: 0 },
+            cur: Snapshot { shapes: Vec::new(), crop: None, effects: EffectSpec::default(), rev: 0 },
             undo: Vec::new(),
             redo: Vec::new(),
             saved_rev: 0,
@@ -917,6 +986,28 @@ impl Document {
     /// Crop rectangle relative to the original image, if any.
     pub fn crop(&self) -> Option<Rect> {
         self.cur.crop
+    }
+
+    /// Output effects (rounded corners, border, shadow, torn edges,
+    /// watermark) applied after crop + annotations on export.
+    pub fn effects(&self) -> &EffectSpec {
+        &self.cur.effects
+    }
+
+    /// Replace the effects (one undo step). No-op when unchanged.
+    pub fn set_effects(&mut self, spec: EffectSpec) {
+        if self.cur.effects == spec {
+            return;
+        }
+        self.begin_edit();
+        self.cur.effects = spec;
+    }
+
+    /// Mutate the effects **without** an undo point; call
+    /// [`begin_edit`](Self::begin_edit) first (once per slider drag).
+    pub fn effects_live(&mut self) -> &mut EffectSpec {
+        self.bump();
+        &mut self.cur.effects
     }
 
     pub fn can_undo(&self) -> bool {
@@ -1764,5 +1855,68 @@ mod tests {
         // a new edit drops the redo tail
         d.add_shape(r(5.0));
         assert_eq!(d.history_len(), 2);
+    }
+
+    #[test]
+    fn spotlight_and_magnify_hit() {
+        let sp = Shape::new(ShapeKind::Spotlight { a: Pt::new(10.0, 10.0), b: Pt::new(50.0, 40.0) }, [0; 4], 1.0);
+        assert!(sp.hit(Pt::new(30.0, 25.0), 2.0));
+        assert!(!sp.hit(Pt::new(70.0, 25.0), 2.0));
+        let mg = Shape::new(ShapeKind::Magnify { center: Pt::new(100.0, 100.0), radius: 30.0, zoom: 2.0 }, [0; 4], 3.0);
+        assert!(mg.hit(Pt::new(100.0, 100.0), 2.0), "centre");
+        assert!(mg.hit(Pt::new(125.0, 100.0), 2.0), "inside");
+        assert!(!mg.hit(Pt::new(140.0, 100.0), 2.0), "outside");
+        let mut d = Document::new();
+        d.add_shape(sp);
+        d.add_shape(mg);
+        assert_eq!(d.hit_test(Pt::new(100.0, 100.0), 2.0), Some(1));
+        assert_eq!(d.hit_test(Pt::new(20.0, 20.0), 2.0), Some(0));
+    }
+
+    #[test]
+    fn magnify_handle_resizes_radius_and_names() {
+        let mut mg = Shape::new(ShapeKind::Magnify { center: Pt::new(50.0, 50.0), radius: 20.0, zoom: 3.0 }, [0; 4], 3.0);
+        let hs = mg.handles();
+        assert_eq!(hs.len(), 1);
+        assert_eq!(hs[0].pos, Pt::new(70.0, 50.0));
+        mg.drag_handle(0, Pt::new(50.0, 110.0), false);
+        assert!(matches!(mg.kind, ShapeKind::Magnify { radius, zoom, .. } if (radius - 60.0).abs() < 1e-3 && zoom == 3.0));
+        let sp = Shape::new(ShapeKind::Spotlight { a: Pt::new(0.0, 0.0), b: Pt::new(5.0, 5.0) }, [0; 4], 1.0);
+        let labels = object_labels(&[sp.clone(), mg.clone(), sp, mg]);
+        assert_eq!(labels, ["Sorotan 1", "Kaca pembesar 1", "Sorotan 2", "Kaca pembesar 2"]);
+    }
+
+    #[test]
+    fn history_labels_for_new_tools_and_effects() {
+        let mut d = Document::new();
+        d.add_shape(Shape::new(ShapeKind::Spotlight { a: Pt::new(0.0, 0.0), b: Pt::new(9.0, 9.0) }, [0; 4], 1.0));
+        d.add_shape(Shape::new(ShapeKind::Magnify { center: Pt::new(5.0, 5.0), radius: 8.0, zoom: 2.0 }, [0; 4], 1.0));
+        let spec = EffectSpec { corner_radius: 12, ..EffectSpec::default() };
+        d.set_effects(spec);
+        assert_eq!(d.history_labels(), ["Buka", "Tambah Sorotan", "Tambah Kaca pembesar", "Efek"]);
+    }
+
+    #[test]
+    fn effects_undo_redo_and_live_edit_is_one_step() {
+        let mut d = Document::new();
+        assert!(d.effects().is_noop());
+        let spec = EffectSpec { border_width: 4, ..EffectSpec::default() };
+        d.set_effects(spec.clone());
+        d.set_effects(spec); // unchanged: no new step
+        assert_eq!(d.history_len(), 2);
+        d.begin_edit();
+        for r in 1..=20 {
+            d.effects_live().corner_radius = r;
+        }
+        assert_eq!(d.history_len(), 3, "a drag is one undo step");
+        assert_eq!(d.effects().corner_radius, 20);
+        assert!(d.undo());
+        assert_eq!(d.effects().corner_radius, 0);
+        assert_eq!(d.effects().border_width, 4);
+        assert!(d.undo());
+        assert!(d.effects().is_noop());
+        assert!(d.redo() && d.redo());
+        assert_eq!(d.effects().corner_radius, 20);
+        assert!(d.is_dirty());
     }
 }
