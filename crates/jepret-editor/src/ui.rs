@@ -107,6 +107,100 @@ fn handle_cursor(k: HandleKind) -> egui::CursorIcon {
     }
 }
 
+/// Cursor shown over the canvas for `tool` when nothing more specific
+/// (handle, grabbable object, pan) applies. egui has no eyedropper cursor,
+/// so the colour picker uses the crosshair as well.
+pub(crate) fn tool_cursor(tool: Tool) -> egui::CursorIcon {
+    use egui::CursorIcon as C;
+    match tool {
+        Tool::Select => C::Default,
+        Tool::Text => C::Text,
+        Tool::Crop
+        | Tool::Arrow
+        | Tool::Line
+        | Tool::Rect
+        | Tool::Ellipse
+        | Tool::TextBox
+        | Tool::Callout
+        | Tool::Highlight
+        | Tool::Blur
+        | Tool::Pixelate
+        | Tool::Step
+        | Tool::Pen
+        | Tool::Polygon
+        | Tool::Spotlight
+        | Tool::Magnify
+        | Tool::Eyedropper => C::Crosshair,
+    }
+}
+
+/// What the user is doing on the canvas right now (for the status-bar hint).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HintState {
+    Idle,
+    Drawing,
+    Polygon,
+    Typing,
+}
+
+/// One-line hint for the status bar: what the tool does and which modifiers apply.
+pub(crate) fn tool_hint(tool: Tool, state: HintState) -> &'static str {
+    match state {
+        HintState::Typing => return "Ketik teks · Ctrl+Enter / klik di luar = selesai · Esc = batal",
+        HintState::Polygon => {
+            return "Klik = tambah titik · klik titik awal / Enter / dobel-klik = selesai · Backspace = hapus titik · Shift = 45° · Esc = batal"
+        }
+        HintState::Drawing => {
+            return match tool {
+                Tool::Arrow | Tool::Line => "Lepas = selesai · Shift = lurus 45° · Alt = dari tengah · Esc = batal",
+                Tool::Pen => "Lepas = selesai · Esc = batal",
+                Tool::Magnify => "Lepas = selesai · radius mengikuti pointer · Esc = batal",
+                _ => "Lepas = selesai · Shift = proporsional · Alt = dari tengah · Esc = batal",
+            }
+        }
+        HintState::Idle => {}
+    }
+    match tool {
+        Tool::Select => "Klik = pilih · Shift/Ctrl+klik = tambah · drag = pindah · panah = geser 1 px (Shift 10) · Del = hapus",
+        Tool::Crop => "Drag area yang dipertahankan · Enter = terapkan · Esc = batal",
+        Tool::Arrow | Tool::Line => "Drag = gambar · Shift = lurus 45° · Alt = dari tengah · Ctrl = gambar di atas objek",
+        Tool::Rect | Tool::Ellipse | Tool::Highlight | Tool::Blur | Tool::Pixelate | Tool::Spotlight => {
+            "Drag = gambar · Shift = proporsional · Alt = dari tengah · Ctrl = gambar di atas objek"
+        }
+        Tool::Pen => "Drag = coret bebas · Ctrl = gambar di atas objek",
+        Tool::Polygon => "Klik = titik pertama · Shift = 45° · Ctrl = gambar di atas objek",
+        Tool::Step => "Klik = taruh nomor langkah berikutnya",
+        Tool::Text => "Klik = tulis teks · klik teks yang ada = ubah",
+        Tool::TextBox => "Drag = lebar kotak lalu ketik · klik = kotak otomatis",
+        Tool::Callout => "Drag dari titik yang ditunjuk ke posisi balon, lalu ketik",
+        Tool::Magnify => "Drag dari pusat ke tepi lingkaran · zoom diatur di Properti",
+        Tool::Eyedropper => "Klik piksel = ambil warna",
+    }
+}
+
+/// A freshly dragged shape is kept only when it is not (nearly) zero-size,
+/// so a plain click never leaves an invisible object behind.
+pub(crate) fn drag_big_enough(kind: &ShapeKind) -> bool {
+    match kind {
+        ShapeKind::Pen { points } => points.len() >= 2,
+        ShapeKind::Arrow { a, b }
+        | ShapeKind::Line { a, b }
+        | ShapeKind::Rect { a, b }
+        | ShapeKind::Ellipse { a, b }
+        | ShapeKind::Highlight { a, b }
+        | ShapeKind::Blur { a, b }
+        | ShapeKind::Spotlight { a, b }
+        | ShapeKind::Pixelate { a, b } => a.dist(*b) >= 3.0,
+        ShapeKind::Magnify { radius, .. } => *radius >= 3.0,
+        _ => true,
+    }
+}
+
+/// Pointing-hand cursor on hover for clickable custom-painted controls.
+fn hand(r: egui::Response) -> egui::Response {
+    r.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 pub struct EditorApp {
     path: PathBuf,
     config: Config,
@@ -163,6 +257,8 @@ pub struct EditorApp {
 
     text_edit: Option<TextEdit>,
     confirm_close: bool,
+    /// A sidebar text field (watermark) had keyboard focus last frame.
+    field_focus: bool,
     force_close: bool,
     show_help: bool,
     help_query: String,
@@ -227,6 +323,7 @@ impl EditorApp {
             crop_before: None,
             text_edit: None,
             confirm_close: false,
+            field_focus: false,
             force_close: false,
             show_help: false,
             help_query: String::new(),
@@ -550,6 +647,16 @@ impl EditorApp {
             }
             return;
         }
+        // Typing in a sidebar field (watermark): no shortcuts; Esc leaves the field.
+        if self.field_focus {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                if let Some(id) = ctx.memory(|m| m.focused()) {
+                    ctx.memory_mut(|m| m.surrender_focus(id));
+                }
+                self.field_focus = false;
+            }
+            return;
+        }
         // An active polygon draft owns Enter / Esc / Backspace.
         if self.poly_draft.is_some() && !self.confirm_close && !self.show_help {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
@@ -690,32 +797,34 @@ impl EditorApp {
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = SP_2;
                     ui.add_enabled_ui(can_undo, |ui| {
-                        if IconButton::new(Icon::Undo, "Undo").shortcut(h_undo.as_deref()).show(ui, &pal).clicked() {
+                        if hand(IconButton::new(Icon::Undo, "Undo").shortcut(h_undo.as_deref()).show(ui, &pal)).clicked() {
                             cmd = Some("edit.undo");
                         }
                     });
                     ui.add_enabled_ui(can_redo, |ui| {
-                        if IconButton::new(Icon::Redo, "Redo").shortcut(h_redo.as_deref()).show(ui, &pal).clicked() {
+                        if hand(IconButton::new(Icon::Redo, "Redo").shortcut(h_redo.as_deref()).show(ui, &pal)).clicked() {
                             cmd = Some("edit.redo");
                         }
                     });
                     let (sep, _) = ui.allocate_exact_size(vec2(1.0, 24.0), Sense::hover());
                     ui.painter().rect_filled(sep, 0.0, pal.line);
                     ui.label(egui::RichText::new(info).size(TEXT_SMALL).color(pal.muted));
-                    if has_crop && button(ui, &pal, None, "Reset crop", None).clicked() {
+                    if has_crop
+                        && hand(button(ui, &pal, None, "Reset crop", None).on_hover_text("Hapus crop, tampilkan gambar penuh (bisa di-undo)")).clicked()
+                    {
                         reset_crop = true;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if primary_button(ui, &pal, "Copy & tutup", h_close.as_deref()).clicked() {
+                        if hand(primary_button(ui, &pal, "Copy & tutup", h_close.as_deref()).on_hover_text("Salin ke clipboard lalu tutup editor")).clicked() {
                             cmd = Some("file.copy_close");
                         }
-                        if button(ui, &pal, Some(Icon::OpenExternal), "Buka di…", h_open.as_deref()).clicked() {
+                        if hand(button(ui, &pal, Some(Icon::OpenExternal), "Buka di…", h_open.as_deref()).on_hover_text("Buka gambar di aplikasi lain")).clicked() {
                             cmd = Some("file.open_with");
                         }
-                        if button(ui, &pal, Some(Icon::Save), "Simpan", h_save.as_deref()).clicked() {
+                        if hand(button(ui, &pal, Some(Icon::Save), "Simpan", h_save.as_deref()).on_hover_text("Simpan ke file")).clicked() {
                             cmd = Some("file.save");
                         }
-                        if button(ui, &pal, Some(Icon::Copy), "Copy", h_copy.as_deref()).clicked() {
+                        if hand(button(ui, &pal, Some(Icon::Copy), "Copy", h_copy.as_deref()).on_hover_text("Salin ke clipboard")).clicked() {
                             cmd = Some("file.copy");
                         }
                     });
@@ -807,7 +916,7 @@ impl EditorApp {
                                     .selected(self.s.tool == *t)
                                     .shortcut(hint.as_deref())
                                     .corner_key(true);
-                                if b.show(ui, &pal).clicked() {
+                                if hand(b.show(ui, &pal)).clicked() {
                                     picked = Some(*t);
                                 }
                             }
@@ -832,6 +941,17 @@ impl EditorApp {
         let (h_fit, h_100, h_help) =
             (self.keymap.hint("view.zoom_fit"), self.keymap.hint("view.zoom_100"), self.keymap.hint("view.cheatsheet"));
         let count = self.s.doc.shapes().len();
+        let state = if self.text_edit.is_some() {
+            HintState::Typing
+        } else if self.poly_draft.is_some() {
+            HintState::Polygon
+        } else if self.drawing.is_some() {
+            HintState::Drawing
+        } else {
+            HintState::Idle
+        };
+        let hint = tool_hint(self.s.tool, state);
+        let mut zoom_click = false;
         let r = egui::TopBottomPanel::bottom("status")
             .exact_height(28.0)
             .frame(egui::Frame::none().fill(pal.surface).inner_margin(egui::Margin::symmetric(14.0, 0.0)))
@@ -845,7 +965,12 @@ impl EditorApp {
                     }
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = SP_1;
-                        ui.label(muted(format!("Zoom {zoom:.0}%")));
+                        let zl = ui
+                            .add(egui::Label::new(muted(format!("Zoom {zoom:.0}%"))).sense(Sense::click()))
+                            .on_hover_text("Klik = pas layar / 100% · Ctrl+scroll = zoom di kursor");
+                        if hand(zl).clicked() {
+                            zoom_click = true;
+                        }
                         if !h_fit.is_empty() {
                             ui.label(mono(&h_fit));
                             ui.label(muted("pas ·".into()));
@@ -865,10 +990,19 @@ impl EditorApp {
                             ui.label(egui::RichText::new("Semua shortcut").size(TEXT_SMALL).color(pal.text));
                             kbd(ui, &pal, &h_help);
                         }
-                        ui.label(muted("Space+drag geser · Ctrl+scroll zoom".into()));
+                        ui.add(egui::Label::new(muted(format!("{hint} · Spasi+drag = geser"))).truncate());
                     });
                 });
             });
+        if zoom_click {
+            // Toggle: fit when at 100%, otherwise back to 100%.
+            if (self.zoom * ctx.pixels_per_point() - 1.0).abs() < 0.005 {
+                self.fit_pending = true;
+            } else {
+                self.zoom = 1.0 / ctx.pixels_per_point();
+                self.fit_pending = false;
+            }
+        }
         r.response.rect
     }
 
@@ -979,7 +1113,7 @@ impl EditorApp {
                             label,
                         );
                         let id = format!("style.color_{}", i + 1);
-                        if resp.on_hover_text(self.tip(&format!("Warna {}", i + 1), &id)).clicked() {
+                        if hand(resp.on_hover_text(self.tip(&format!("Warna {}", i + 1), &id))).clicked() {
                             self.run_command(ctx, &id, false);
                         }
                     } else if i == 9 {
@@ -992,7 +1126,7 @@ impl EditorApp {
                         ui.painter().extend(EShape::dashed_line(&pts, Stroke::new(1.0_f32, pal.line_strong), 4.0, 3.0));
                         ui.painter().text(rect.center(), Align2::CENTER_CENTER, "+", FontId::proportional(16.0), pal.muted);
                         let pid = ui.make_persistent_id("custom_color");
-                        if resp.clone().on_hover_text("Warna lain").clicked() {
+                        if hand(resp.clone().on_hover_text("Warna lain")).clicked() {
                             ui.memory_mut(|m| m.toggle_popup(pid));
                         }
                         egui::popup::popup_below_widget(
@@ -1050,10 +1184,10 @@ impl EditorApp {
             (self.sc("style.toggle_fill"), self.sc("style.toggle_shadow"), self.sc("style.toggle_outline"));
         let (mut c_fill, mut c_sh, mut c_ol) = (false, false, false);
         ui.columns(2, |cols| {
-            c_fill = toggle(&mut cols[0], &pal, &mut fill, "Isi", h_fill.as_deref()).changed();
-            c_sh = toggle(&mut cols[1], &pal, &mut sh, "Bayangan", h_sh.as_deref()).changed();
+            c_fill = hand(toggle(&mut cols[0], &pal, &mut fill, "Isi", h_fill.as_deref())).changed();
+            c_sh = hand(toggle(&mut cols[1], &pal, &mut sh, "Bayangan", h_sh.as_deref())).changed();
             if show_outline {
-                c_ol = toggle(&mut cols[0], &pal, &mut ol, "Garis tepi", h_ol.as_deref()).changed();
+                c_ol = hand(toggle(&mut cols[0], &pal, &mut ol, "Garis tepi", h_ol.as_deref())).changed();
             }
         });
         if c_fill {
@@ -1075,7 +1209,7 @@ impl EditorApp {
             });
             let cur = sel.map_or(self.magnify_zoom, |(_, z)| z);
             let mut idx = crate::doc::MAGNIFY_ZOOMS.iter().position(|z| (z - cur).abs() < 0.01).unwrap_or(1);
-            if segmented(ui, &pal, &mut idx, &["1.5×", "2×", "3×", "4×"]).changed() {
+            if hand(segmented(ui, &pal, &mut idx, &["1.5×", "2×", "3×", "4×"])).changed() {
                 let z = crate::doc::MAGNIFY_ZOOMS.get(idx).copied().unwrap_or(crate::doc::MAGNIFY_DEFAULT_ZOOM);
                 self.magnify_zoom = z;
                 if let Some((i, _)) = sel {
@@ -1102,6 +1236,7 @@ impl EditorApp {
     /// crop + annotations on copy/save). Collapsed by default.
     fn effects_panel(&mut self, ui: &mut egui::Ui, ctx: &Context) {
         let pal = self.pal;
+        self.field_focus = false;
         self.side_sep(ui);
         let active = !self.s.doc.effects().is_noop();
         let (_, clicked) = panel_header(ui, &pal, self.panels_open[3], "Efek", if active { "aktif" } else { "" }, 0.0);
@@ -1144,6 +1279,7 @@ impl EditorApp {
                         let on = cur.is_some_and(|k| k[..3] == c[..3]);
                         let stroke = if on { Stroke::new(2.0_f32, pal.text) } else { Stroke::new(1.0_f32, pal.line) };
                         ui.painter().rect(rect, RADIUS_CONTROL, Color32::from_rgb(c[0], c[1], c[2]), stroke);
+                        let resp = hand(resp).on_hover_text(format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]));
                         if resp.clicked() {
                             spec.border_color = format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
                         }
@@ -1153,7 +1289,7 @@ impl EditorApp {
             // Bayangan
             sub(ui, "Bayangan");
             let mut on = spec.shadow_blur > 0;
-            if toggle(ui, &pal, &mut on, "Aktif", None).changed() {
+            if hand(toggle(ui, &pal, &mut on, "Aktif", None)).changed() {
                 spec.shadow_blur = if on { 12 } else { 0 };
             }
             if spec.shadow_blur > 0 {
@@ -1171,10 +1307,10 @@ impl EditorApp {
             // Tepi sobek
             sub(ui, "Tepi sobek");
             ui.horizontal_wrapped(|ui| {
-                ui.checkbox(&mut spec.torn.top, "Atas");
-                ui.checkbox(&mut spec.torn.right, "Kanan");
-                ui.checkbox(&mut spec.torn.bottom, "Bawah");
-                ui.checkbox(&mut spec.torn.left, "Kiri");
+                hand(ui.checkbox(&mut spec.torn.top, "Atas"));
+                hand(ui.checkbox(&mut spec.torn.right, "Kanan"));
+                hand(ui.checkbox(&mut spec.torn.bottom, "Bawah"));
+                hand(ui.checkbox(&mut spec.torn.left, "Kiri"));
             });
             if spec.torn.any() {
                 let mut v = spec.torn_size as f32;
@@ -1193,6 +1329,7 @@ impl EditorApp {
                     .desired_width(f32::INFINITY),
             );
             text_focus = te.has_focus();
+            self.field_focus = text_focus;
             ui.label(egui::RichText::new("Posisi").size(TEXT_SMALL).color(pal.muted));
             anchor_picker(ui, &pal, &mut wm.position);
             let mut v = wm.size as f32;
@@ -1209,7 +1346,7 @@ impl EditorApp {
                 spec.watermark = Some(wm);
             }
             ui.add_space(SP_2);
-            if button(ui, &pal, None, "Reset efek", None).clicked() {
+            if hand(button(ui, &pal, None, "Reset efek", None).on_hover_text("Kembalikan semua efek ke bawaan")).clicked() {
                 spec = EffectSpec::default();
             }
         });
@@ -1250,7 +1387,10 @@ impl EditorApp {
             for (k, &(label, id)) in acts.iter().enumerate().rev() {
                 let r = ERect::from_min_size(pos2(x, head.center().y - 12.0), vec2(24.0, 24.0));
                 x -= 26.0;
-                let resp = ui.interact(r, ui.id().with(("obj_act", k)), Sense::click()).on_hover_text(self.tip(label, id));
+                let mut resp = ui.interact(r, ui.id().with(("obj_act", k)), Sense::click()).on_hover_text(self.tip(label, id));
+                if has_sel {
+                    resp = hand(resp);
+                }
                 let hot = has_sel && resp.hovered();
                 if hot {
                     ui.painter().rect_filled(r, RADIUS_CONTROL, pal.raised);
@@ -1325,6 +1465,14 @@ impl EditorApp {
                 let selected = self.s.is_selected(i);
                 if resp.hovered() {
                     self.hover_obj = Some(i);
+                    let on_grip = resp.hover_pos().is_some_and(|h| h.x < rect.left() + 22.0);
+                    ctx.set_cursor_icon(if resp.dragged() {
+                        egui::CursorIcon::Grabbing
+                    } else if on_grip {
+                        egui::CursorIcon::Grab
+                    } else {
+                        egui::CursorIcon::PointingHand
+                    });
                 }
                 let p = ui.painter();
                 if selected {
@@ -1463,6 +1611,7 @@ impl EditorApp {
         egui::ScrollArea::vertical().id_salt("hist_list").max_height(HIST_BODY_H).auto_shrink([false, false]).show(ui, |ui| {
             for (i, label) in labels.iter().enumerate() {
                 let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+                let resp = if i == pos { resp } else { hand(resp).on_hover_text("Kembali ke langkah ini") };
                 if !ui.is_rect_visible(rect) && !(follow && i == pos) {
                     continue;
                 }
@@ -1731,7 +1880,7 @@ impl EditorApp {
                                 let (rect, x) = ui.allocate_exact_size(Vec2::splat(CONTROL_H), Sense::click());
                                 ui.painter().rect_filled(rect, RADIUS_CONTROL, if x.hovered() { pal.line } else { pal.raised });
                                 icons::paint(ui.painter(), ERect::from_center_size(rect.center(), Vec2::splat(14.0)), Icon::Close, pal.text, 1.75);
-                                if x.on_hover_text("Tutup (Esc)").clicked() {
+                                if hand(x.on_hover_text("Tutup (Esc)")).clicked() {
                                     close = true;
                                 }
                                 if ui.link("Ubah di Settings").clicked() {
@@ -2106,19 +2255,29 @@ impl EditorApp {
         let pos = resp.interact_pointer_pos().or_else(|| resp.hover_pos()).map(to_img);
         let mods = ctx.input(|i| i.modifiers);
 
+        // Cursor precedence (space-pan and scrollbars are handled before we get here):
+        // resize handle > grabbing/moving > active drawing > handle hover >
+        // movable object > tool cursor.
         if let Some(r) = &self.resizing {
             let kind = self.single_handles().get(r.idx).map(|h| h.kind);
             if let Some(k) = kind {
                 ctx.set_cursor_icon(handle_cursor(k));
             }
-        } else if resp.hovered() && !self.moving {
-            if let Some(p) = resp.hover_pos().map(to_img) {
-                if let Some((_, k)) = self.handle_at(p) {
-                    ctx.set_cursor_icon(handle_cursor(k));
-                } else if self.grab_hit(p, tol, mods.command).is_some() {
-                    ctx.set_cursor_icon(egui::CursorIcon::Move);
-                }
-            }
+        } else if self.moving {
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if self.drawing.is_some() {
+            ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+        } else if resp.hovered() {
+            let hover = resp.hover_pos().map(to_img);
+            let icon = match hover {
+                Some(p) => match self.handle_at(p) {
+                    Some((_, k)) => handle_cursor(k),
+                    None if self.grab_hit(p, tol, mods.command).is_some() => egui::CursorIcon::Move,
+                    None => tool_cursor(self.s.tool),
+                },
+                None => tool_cursor(self.s.tool),
+            };
+            ctx.set_cursor_icon(icon);
         }
 
         if resp.drag_started_by(PointerButton::Primary) {
@@ -2397,19 +2556,7 @@ impl EditorApp {
             }
             return;
         }
-        let big_enough = match &d.kind {
-            ShapeKind::Pen { points } => points.len() >= 2,
-            ShapeKind::Arrow { a, b }
-            | ShapeKind::Line { a, b }
-            | ShapeKind::Rect { a, b }
-            | ShapeKind::Ellipse { a, b }
-            | ShapeKind::Highlight { a, b }
-            | ShapeKind::Blur { a, b }
-            | ShapeKind::Spotlight { a, b }
-            | ShapeKind::Pixelate { a, b } => a.dist(*b) >= 3.0,
-            ShapeKind::Magnify { radius, .. } => *radius >= 3.0,
-            _ => true,
-        };
+        let big_enough = drag_big_enough(&d.kind);
         if big_enough {
             self.s.add_and_select(d);
         }
@@ -2880,6 +3027,7 @@ const OBJ_MIN_H: f32 = HEAD_H + 2.0 * ROW_H + 40.0;
 /// Returns the header rect and whether it was clicked.
 fn panel_header(ui: &mut egui::Ui, pal: &Palette, open: bool, title: &str, right: &str, reserve_right: f32) -> (ERect, bool) {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), HEAD_H), Sense::click());
+    let resp = hand(resp).on_hover_text(if open { "Ciutkan panel" } else { "Buka panel" });
     let p = ui.painter();
     if resp.hovered() {
         p.rect_filled(rect, 0.0, pal.raised.gamma_multiply(0.5));
@@ -2943,6 +3091,7 @@ fn width_slider(ui: &mut egui::Ui, pal: &Palette, value: &mut f32) -> bool {
 /// [`width_slider`] over an arbitrary `lo..=hi`.
 fn range_slider(ui: &mut egui::Ui, pal: &Palette, value: &mut f32, lo: f32, hi: f32) -> bool {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 16.0), Sense::click_and_drag());
+    let resp = if resp.dragged() { resp.on_hover_cursor(egui::CursorIcon::Grabbing) } else { hand(resp) };
     let (l, r) = (rect.left() + 8.0, rect.right() - 8.0);
     let mut changed = false;
     if let Some(p) = resp.interact_pointer_pos() {
@@ -2990,6 +3139,20 @@ fn slider_row(ui: &mut egui::Ui, pal: &Palette, value: &mut f32, lo: f32, hi: f3
     changed
 }
 
+fn anchor_name(a: Anchor) -> &'static str {
+    match a {
+        Anchor::TopLeft => "Kiri atas",
+        Anchor::Top => "Atas",
+        Anchor::TopRight => "Kanan atas",
+        Anchor::Left => "Kiri",
+        Anchor::Center => "Tengah",
+        Anchor::Right => "Kanan",
+        Anchor::BottomLeft => "Kiri bawah",
+        Anchor::Bottom => "Bawah",
+        Anchor::BottomRight => "Kanan bawah",
+    }
+}
+
 /// 3x3 grid to pick a watermark anchor.
 fn anchor_picker(ui: &mut egui::Ui, pal: &Palette, pos: &mut Anchor) {
     const GRID: [[Anchor; 3]; 3] = [
@@ -3001,6 +3164,7 @@ fn anchor_picker(ui: &mut egui::Ui, pal: &Palette, pos: &mut Anchor) {
         ui.horizontal(|ui| {
             for a in row {
                 let (rect, resp) = ui.allocate_exact_size(vec2(26.0, 16.0), Sense::click());
+                let resp = hand(resp).on_hover_text(anchor_name(a));
                 let on = *pos == a;
                 let fill = if on { pal.accent } else if resp.hovered() { pal.line_strong } else { pal.raised };
                 ui.painter().rect(rect, 3.0, fill, Stroke::new(1.0_f32, pal.line));
@@ -3052,7 +3216,7 @@ impl eframe::App for EditorApp {
 
         // Buttons/sliders must not keep keyboard focus: Enter/Space/arrows
         // belong to the shortcut map (except while typing text).
-        if self.text_edit.is_none() && !self.show_help {
+        if self.text_edit.is_none() && !self.show_help && !self.field_focus {
             if let Some(id) = ctx.memory(|m| m.focused()) {
                 ctx.memory_mut(|m| m.surrender_focus(id));
             }
@@ -3103,4 +3267,42 @@ pub fn run(path: PathBuf, config: Config) -> jepret_core::Result<()> {
         }),
     )
         .map_err(|e| anyhow::anyhow!("editor window failed: {e}"))
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+    use egui::CursorIcon as C;
+
+    #[test]
+    fn tool_cursors() {
+        assert_eq!(tool_cursor(Tool::Select), C::Default);
+        assert_eq!(tool_cursor(Tool::Text), C::Text);
+        for t in Tool::ALL {
+            if !matches!(t, Tool::Select | Tool::Text) {
+                assert_eq!(tool_cursor(t), C::Crosshair, "{t:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_tool_has_a_hint() {
+        for t in Tool::ALL {
+            for st in [HintState::Idle, HintState::Drawing, HintState::Polygon, HintState::Typing] {
+                assert!(!tool_hint(t, st).is_empty());
+            }
+        }
+        assert!(tool_hint(Tool::Rect, HintState::Idle).contains("Ctrl"));
+        assert!(tool_hint(Tool::Rect, HintState::Drawing).contains("Shift"));
+    }
+
+    #[test]
+    fn click_without_drag_makes_no_shape() {
+        let p = Pt::new(10.0, 10.0);
+        assert!(!drag_big_enough(&ShapeKind::Rect { a: p, b: p }));
+        assert!(!drag_big_enough(&ShapeKind::Ellipse { a: p, b: Pt::new(11.0, 11.0) }));
+        assert!(drag_big_enough(&ShapeKind::Rect { a: p, b: Pt::new(20.0, 10.0) }));
+        assert!(!drag_big_enough(&ShapeKind::Pen { points: vec![p] }));
+        assert!(!drag_big_enough(&ShapeKind::Magnify { center: p, radius: 1.0, zoom: 2.0 }));
+    }
 }
