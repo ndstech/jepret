@@ -1,0 +1,46 @@
+JEPRET — aplikasi screenshot ringan untuk Windows 10/11 (64-bit)
+==================================================================
+
+PASANG
+1. Ekstrak zip ini ke folder tetap, misalnya C:\Tools\Jepret\
+2. Jalankan jepret.exe. Ikon Jepret muncul di tray (pojok kanan bawah).
+   - Kalau muncul "Windows protected your PC": klik "More info" -> "Run anyway".
+     (Aplikasi belum ditandatangani digital, bukan virus.)
+3. WAJIB agar tombol PrtSc dipakai Jepret, bukan Snipping Tool:
+   Settings > Bluetooth & devices > Keyboard >
+   matikan "Use the Print screen key to open screen capture".
+4. Opsional: di Settings Jepret (klik kanan tray > Settings) nyalakan
+   "Jalankan saat Windows start".
+
+TOMBOL BAWAAN
+  PrtSc                  Pilih area  -> simpan, salin, buka editor
+  Ctrl+PrtSc             Layar penuh
+  Alt+PrtSc              Window aktif
+  Shift+PrtSc            Area terakhir
+  Ctrl+Shift+PrtSc       Scroll capture (halaman panjang)
+  Ctrl+Alt+PrtSc         Rekam layar (area)  — tekan lagi untuk berhenti
+  Alt+Shift+PrtSc        Rekam satu monitor
+  Klik kanan tray        Ambil teks (OCR), Galeri, Settings, Keluar
+
+SAAT MEMILIH AREA
+  Drag lalu lepas = langsung diambil.  Esc / klik kanan = batal.
+  Tab = pilih window, F = satu monitor, A = semua monitor, Enter = ambil.
+  R = seleksi pakai keyboard (panah memperluas; tahan = makin cepat,
+      Shift = 10 px, Tab = geser, Enter = ambil).
+  M = kaca pembesar, C = salin kode warna, H = sembunyikan petunjuk.
+
+EDITOR
+  Tekan F1 di editor untuk daftar semua shortcut.
+  Enter = Copy & tutup, Ctrl+S = simpan, Ctrl+C = salin.
+
+LOKASI FILE
+  Hasil screenshot : Pictures\Jepret\
+  Pengaturan       : %APPDATA%\Jepret\config.toml
+  Riwayat & log    : %LOCALAPPDATA%\Jepret\
+
+UPDATE
+  Keluar dari Jepret (klik kanan tray > Keluar), ganti jepret.exe dengan
+  versi baru, jalankan lagi. Pengaturan & riwayat tetap.
+
+OCR (ambil teks) memakai bahasa OCR Windows yang terpasang
+(Settings > Time & language > Language). Bahasa Inggris biasanya sudah ada.

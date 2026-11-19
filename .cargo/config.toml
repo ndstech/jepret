@@ -1,0 +1,4 @@
+# Static MSVC runtime: jepret.exe runs on a clean Windows 10/11 without the
+# Visual C++ Redistributable (portable single-exe distribution).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
