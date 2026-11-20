@@ -21,7 +21,7 @@ use jepret_ui_theme::tokens::{
     CONTROL_H, RADIUS_CONTROL, RADIUS_PANEL, SP_1, SP_2, SP_3, SP_4, TEXT_BODY, TEXT_SMALL, TOOL_BTN,
 };
 use jepret_ui_theme::widgets::{button, kbd, primary_button, segmented, toggle, IconButton};
-use jepret_ui_theme::{icons, Icon, Palette};
+use jepret_ui_theme::{icons, widgets, Icon, Palette};
 use jepret_core::effects::{Anchor, Watermark};
 use jepret_core::{Config, EffectSpec, Image, Rect};
 
@@ -733,8 +733,20 @@ impl EditorApp {
         }
         for (combo, repeat) in combos {
             if self.confirm_close {
+                match combo.to_string().as_str() {
+                    "escape" => self.confirm_close = false,
+                    "enter" if !repeat && self.save(false) => {
+                        self.force_close = true;
+                        self.confirm_close = false;
+                        self.close(ctx);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            if self.open_with_menu {
                 if combo.to_string() == "escape" {
-                    self.confirm_close = false;
+                    self.open_with_menu = false;
                 }
                 continue;
             }
@@ -1715,55 +1727,166 @@ impl EditorApp {
         if !self.confirm_close {
             return;
         }
-        egui::Window::new("Unsaved changes")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.label("Discard your annotations?");
+        let pal = self.pal;
+        let file_name = self.path.file_name().and_then(|n| n.to_str()).unwrap_or("gambar").to_string();
+        let mut action: Option<u8> = None; // 1 = save & close, 2 = discard, 3 = cancel
+
+        let dismissed = widgets::modal_dialog(
+            ctx,
+            &pal,
+            "confirm_close_modal",
+            440.0,
+            Some((Icon::Warning, widgets::ModalTone::Warn)),
+            "Perubahan belum disimpan",
+            |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!(
+                            "Anotasi pada {file_name} belum disimpan. Simpan perubahan sebelum menutup editor?"
+                        ))
+                        .color(pal.muted),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(SP_4);
+                let (sep, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+                ui.painter().rect_filled(sep, 0.0, pal.line);
+                ui.add_space(SP_3);
+
                 ui.horizontal(|ui| {
-                    if ui.button("Save & close").clicked() && self.save(false) {
-                        self.force_close = true;
-                        self.confirm_close = false;
-                        self.close(ctx);
+                    if widgets::danger_soft_button(ui, &pal, "Buang", None).clicked() {
+                        action = Some(2);
                     }
-                    if ui.button("Discard").clicked() {
-                        self.force_close = true;
-                        self.confirm_close = false;
-                        self.close(ctx);
-                    }
-                    if ui.button("Cancel (Esc)").clicked() {
-                        self.confirm_close = false;
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let enter_hint = self.config.editor.show_shortcut_hints.then_some("Enter");
+                        if hand(widgets::primary_button(ui, &pal, "Simpan & tutup", enter_hint)).clicked() {
+                            action = Some(1);
+                        }
+                        let esc_hint = self.config.editor.show_shortcut_hints.then_some("Esc");
+                        if hand(widgets::button(ui, &pal, None, "Batal", esc_hint)).clicked() {
+                            action = Some(3);
+                        }
+                    });
                 });
-            });
+            },
+        );
+
+        if dismissed && action.is_none() {
+            action = Some(3);
+        }
+        match action {
+            Some(1) => {
+                if self.save(false) {
+                    self.force_close = true;
+                    self.confirm_close = false;
+                    self.close(ctx);
+                }
+            }
+            Some(2) => {
+                self.force_close = true;
+                self.confirm_close = false;
+                self.close(ctx);
+            }
+            Some(3) => {
+                self.confirm_close = false;
+            }
+            _ => {}
+        }
     }
 
     fn open_with_dialog(&mut self, ctx: &Context) {
         if !self.open_with_menu {
             return;
         }
+        let pal = self.pal;
         let apps: Vec<(String, ExternalApp)> = self.config.apps.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         let mut picked: Option<(String, ExternalApp)> = None;
-        let mut open = true;
-        egui::Window::new("Open with")
-            .collapsible(false)
-            .resizable(false)
-            .open(&mut open)
-            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                for (k, app) in &apps {
-                    let name = app.name.clone().unwrap_or_else(|| k.clone());
-                    if ui.button(name).clicked() {
-                        picked = Some((k.clone(), app.clone()));
-                    }
+        let mut close = false;
+        let mut open_settings = false;
+
+        let dismissed = widgets::modal_dialog(
+            ctx,
+            &pal,
+            "open_with_modal",
+            400.0,
+            Some((Icon::OpenExternal, widgets::ModalTone::Accent)),
+            "Buka di aplikasi lain",
+            |ui| {
+                ui.label(egui::RichText::new("Pilih aplikasi eksternal untuk membuka gambar ini.").color(pal.muted));
+                ui.add_space(SP_3);
+
+                if apps.is_empty() {
+                    egui::Frame::none()
+                        .fill(pal.bg)
+                        .stroke(Stroke::new(1.0_f32, pal.line))
+                        .rounding(RADIUS_CONTROL)
+                        .inner_margin(egui::Margin::symmetric(SP_3, SP_3))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(egui::RichText::new("Belum ada aplikasi eksternal yang dikonfigurasi.").color(pal.muted));
+                        });
+                } else {
+                    egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = SP_1;
+                        for (k, app) in &apps {
+                            let name = app.name.clone().unwrap_or_else(|| k.clone());
+                            let sub = app.path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                            let w = ui.available_width();
+                            let (rect, resp) = ui.allocate_exact_size(vec2(w, 42.0), Sense::click());
+                            let fill = if resp.hovered() { pal.raised } else { pal.bg };
+                            let border = if resp.hovered() { pal.line_strong } else { pal.line };
+                            ui.painter().rect(rect, RADIUS_CONTROL, fill, Stroke::new(1.0_f32, border));
+                            ui.painter().text(
+                                pos2(rect.left() + 12.0, rect.top() + 14.0),
+                                Align2::LEFT_CENTER,
+                                &name,
+                                FontId::proportional(TEXT_BODY),
+                                pal.text,
+                            );
+                            if !sub.is_empty() {
+                                ui.painter().text(
+                                    pos2(rect.left() + 12.0, rect.bottom() - 12.0),
+                                    Align2::LEFT_CENTER,
+                                    sub,
+                                    FontId::monospace(10.5),
+                                    pal.muted,
+                                );
+                            }
+                            let ic_rect = ERect::from_center_size(pos2(rect.right() - 18.0, rect.center().y), Vec2::splat(14.0));
+                            icons::paint(ui.painter(), ic_rect, Icon::OpenExternal, if resp.hovered() { pal.accent } else { pal.muted }, 1.75);
+                            if hand(resp).clicked() {
+                                picked = Some((k.clone(), app.clone()));
+                            }
+                        }
+                    });
                 }
-            });
+
+                ui.add_space(SP_4);
+                let (sep, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+                ui.painter().rect_filled(sep, 0.0, pal.line);
+                ui.add_space(SP_3);
+
+                ui.horizontal(|ui| {
+                    if hand(ui.link("Atur di Settings")).clicked() {
+                        open_settings = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let esc_hint = self.config.editor.show_shortcut_hints.then_some("Esc");
+                        if hand(widgets::button(ui, &pal, None, "Batal", esc_hint)).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            },
+        );
+
         if let Some((k, app)) = picked {
             self.launch_app(&k, &app);
             self.open_with_menu = false;
-        }
-        if !open {
+        } else if open_settings {
+            self.open_with_menu = false;
+            self.open_settings();
+        } else if close || dismissed {
             self.open_with_menu = false;
         }
     }

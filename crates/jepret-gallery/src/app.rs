@@ -311,17 +311,6 @@ fn entry_menu(ui: &mut Ui, pal: &Palette, e: &Entry) -> Option<CellAction> {
     act
 }
 
-fn danger_button(ui: &mut Ui, pal: &Palette, label: &str) -> Response {
-    let font = prop(TEXT_BODY);
-    let w = 12.0 + measure(ui, label, &font) + 12.0;
-    let (rect, resp) = ui.allocate_exact_size(vec2(w, CONTROL_H), Sense::click());
-    let fill = if resp.hovered() { pal.danger.gamma_multiply(0.9) } else { pal.danger };
-    let fg = if pal.dark { Color32::BLACK } else { Color32::WHITE };
-    ui.painter().rect_filled(rect, RADIUS_CONTROL, fill);
-    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, font, fg);
-    resp
-}
-
 /// "18 Nov 2026, 13.45".
 fn when_text(ms: i64) -> String {
     match Local.timestamp_millis_opt(ms).earliest() {
@@ -1422,31 +1411,46 @@ impl Ready {
         let Some(e) = self.confirm_delete.clone() else { return };
         let pal = self.pal;
         let mut decision = None;
-        egui::Window::new("Hapus item?")
-            .title_bar(false)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-            .fixed_size(vec2(360.0, 0.0))
-            .show(ctx, |ui| {
-                ui.label(egui::RichText::new("Hapus item?").size(15.0).strong());
-                ui.add_space(4.0);
-                ui.label(format!("Hapus {} dari riwayat dan dari disk?", file_name(&e)));
+        let dismissed = widgets::modal_dialog(
+            ctx,
+            &pal,
+            "gallery_delete_modal",
+            410.0,
+            Some((Icon::Trash, widgets::ModalTone::Danger)),
+            "Hapus item?",
+            |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("Hapus {} dari riwayat dan dari disk?", file_name(&e))).color(pal.text),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(SP_1);
                 if self.rules.use_recycle_bin {
-                    ui.label(egui::RichText::new("File dipindahkan ke Recycle Bin.").color(pal.muted));
+                    ui.label(egui::RichText::new("File akan dipindahkan ke Recycle Bin.").color(pal.muted));
                 } else {
-                    ui.label(egui::RichText::new("File dihapus permanen.").color(pal.danger));
+                    ui.label(egui::RichText::new("File akan dihapus permanen dan tidak bisa dikembalikan.").color(pal.danger));
                 }
-                ui.add_space(8.0);
+                ui.add_space(SP_4);
+                let (sep, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+                ui.painter().rect_filled(sep, 0.0, pal.line);
+                ui.add_space(SP_3);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if danger_button(ui, &pal, "Hapus").clicked() {
+                    if widgets::danger_button(ui, &pal, "Hapus", None).clicked() {
                         decision = Some(true);
                     }
-                    if widgets::button(ui, &pal, None, "Batal", Some("Esc")).clicked() {
+                    if widgets::button(ui, &pal, None, "Batal", Some("Esc"))
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
                         decision = Some(false);
                     }
                 });
-            });
+            },
+        );
+        if dismissed && decision.is_none() {
+            decision = Some(false);
+        }
         match decision {
             Some(true) => {
                 match self.source.delete(e.id, true, self.rules.use_recycle_bin) {
